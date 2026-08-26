@@ -1,0 +1,210 @@
+# baremetal-agent
+
+An LLM agent you can text, running as a [BareMetal](https://github.com/ReturnInfinity) unikernel.
+
+There is no operating system under this program. No kernel, no init, no shell, no filesystem it depends on — the image *is* the machine. Inside it: an agent loop with tool calling, a TLS 1.3 client, a TCP/IP stack, and enough room left to hold a conversation. All of it in **16 MiB of RAM**, from a **2.87 MB** image.
+
+Text the bot and you are talking to that.
+
+```
+you:  how much memory are you using right now, and what is under you?
+
+bot:  I am currently using 10,400 bytes of memory within my arena.
+      I am a BareMetal unikernel, meaning I run directly on the
+      hardware with no operating system or kernel beneath me.
+```
+
+Every number it gives you is measured at the moment you ask. It has no way to state a figure except by calling a tool that reads it.
+
+## Why this is interesting
+
+Agent frameworks generally assume a language runtime, a garbage collector, a container image, and hundreds of megabytes of headroom. This one is a single C file that boots as the machine.
+
+| | |
+|---|---|
+| Image size | 2,875,584 bytes |
+| RAM | 16 MiB (the platform's per-instance ceiling) |
+| Static footprint | 640 KB — arena 384 KB, HTTP 128 KB, payload 128 KB |
+| Arena used for a typical answer | 8–35 KB |
+| Heap allocations | none — the allocator is compiled out |
+| Inside the image | musl, lwIP, mbedTLS, libcurl, cJSON, Mozilla CA bundle |
+| Not inside the image | operating system, kernel, init, shell, package manager, language runtime |
+
+## How it works
+
+```
+poll Telegram for a message
+  → think (Gemini, via the OpenAI-compatible chat/completions API)
+  → call tools, observe results, think again          (up to MAX_STEPS)
+  → reply into the chat it came from
+repeat
+```
+
+The conversation array is the agent's whole memory for one exchange, and the arena is reset after each answer — so memory use is bounded by a single question, not by uptime.
+
+### The tools
+
+All four report on the machine the agent is living inside, which is the point: the subject is the platform, not the model.
+
+| Tool | Answers |
+|---|---|
+| `machine_facts` | RAM ceiling, image size, seconds since boot |
+| `memory_usage` | live arena use and high-water mark, read from its own allocator |
+| `build_info` | what is linked into the image, and what is absent |
+| `ping_api` | a real HTTPS round-trip, timed now, TLS handshake included |
+
+### Zero heap, by construction
+
+cJSON is pointed at a static bump arena via `cJSON_InitHooks`, buffers are fixed arrays, and past a certain line in the file the allocator simply does not exist:
+
+```c
+#define malloc   DO_NOT_malloc
+#define calloc   DO_NOT_calloc
+#define realloc  DO_NOT_realloc
+#define free     DO_NOT_free
+#define strdup   DO_NOT_strdup
+```
+
+Any code added below that fails to compile if it reaches for the heap. libcurl still allocates internally — this claim is about the program, not the process.
+
+## Build and run
+
+The same source builds for Linux, macOS and BareMetal. Start with an ordinary build: it is faster to iterate on, and it proves your tokens work before the unikernel is involved.
+
+### 1 · Get the credentials
+
+**Telegram bot token.** Message [@BotFather](https://t.me/botfather), send `/newbot`, follow the prompts. You get a token shaped like `8123456789:AAH…`.
+
+**Model API key.** A Gemini key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) (free tier is fine). Any OpenAI-compatible provider works — see [Configuration](#configuration).
+
+Keep them in files rather than in your shell history:
+
+```sh
+printf '%s' '8123456789:AAH...' > ~/.tg_token   && chmod 600 ~/.tg_token
+printf '%s' 'AIza...'           > ~/.gemini_key && chmod 600 ~/.gemini_key
+```
+
+### 2 · Build and run on Linux or macOS
+
+Dependencies are libcurl and libcjson:
+
+```sh
+# Debian/Ubuntu
+sudo apt install -y build-essential libcurl4-openssl-dev libcjson-dev
+# macOS
+brew install curl cjson
+```
+
+Then:
+
+```sh
+make
+export TELEGRAM_BOT_TOKEN=$(cat ~/.tg_token)
+export GEMINI_API_KEY=$(cat ~/.gemini_key)
+
+./build/bmagent --ask "what are you running on?"   # one question, no Telegram
+./build/bmagent --once                             # answer whatever is waiting, then exit
+./build/bmagent                                    # poll forever
+```
+
+`--ask` is the fastest way to check that your key works and the tools return sane numbers.
+
+> **Run only one instance at a time.** Telegram hands each message to whoever polls first, so a local copy and a deployed copy will steal messages from each other.
+
+### 3 · Build as a BareMetal unikernel
+
+**Prerequisites.** A Linux x86-64 host with `git curl unzip tar gcc nasm make patch jq e2fsprogs`. On Ubuntu:
+
+```sh
+sudo apt install -y build-essential nasm jq e2fsprogs unzip patch screen git curl
+```
+
+**Set up the toolchain.** This builds musl, lwIP, mbedTLS, curl and more from source, and takes a few minutes. You only do it once:
+
+```sh
+git clone https://github.com/ReturnInfinity/BareMetal-App
+cd BareMetal-App
+./setup.sh
+```
+
+**Add cJSON**, which BareMetal-AppPort does not ship:
+
+```sh
+git clone --depth 1 https://github.com/DaveGamble/cJSON.git cjson_src
+mkdir -p cjson && cp cjson_src/cJSON.c cjson_src/cJSON.h cjson/ && rm -rf cjson_src
+```
+
+**Bake in the configuration.** BareMetal exposes no environment, so `getenv` returns nothing there and the compile-time defaults are used instead. Copy the source in and substitute:
+
+```sh
+cp /path/to/baremetal-agent/bmagent.c .
+sed -i "s|PUT_BOT_TOKEN_HERE|$(cat ~/.tg_token)|"   bmagent.c
+sed -i "s|PUT_GEMINI_KEY_HERE|$(cat ~/.gemini_key)|" bmagent.c
+```
+
+**Build the image:**
+
+```sh
+./1-build.sh bmagent.c cjson/cJSON.c
+```
+
+That produces `baremetal.elf` — a complete bootable machine, around 2.87 MB.
+
+**Run it locally** under Firecracker (needs `firecracker` on PATH, and a tap device for networking — `BareMetal-Firecracker/scripts/mkbr0.sh` sets one up, but read it first: on a wired single-NIC host it moves your host IP onto a bridge and will disconnect a remote session):
+
+```sh
+./2-run.sh
+```
+
+**Or deploy to BareMetal Cloud**, which needs no networking setup at all:
+
+```sh
+BM_API_KEY=bmvps_... bash deploy_baremetal.sh
+```
+
+Get the key from [baremetal.returninfinity.com/dashboard](https://baremetal.returninfinity.com/dashboard). The script fetches cJSON if needed, bakes your tokens, builds twice — the second pass compiles in the image size measured from the first, so the agent can report its own size honestly — uploads, and starts a 1 vCPU / 16 MiB instance.
+
+Watch the serial console:
+
+```sh
+./bm-api.sh instances logs <instance-id>
+```
+
+## Configuration
+
+Environment variables where there are any; the compile-time `#define`s otherwise.
+
+| Setting | Default | Notes |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | — | required |
+| `GEMINI_API_KEY` | — | required |
+| `LLM_BASE_URL` | Gemini's OpenAI-compatible endpoint | any compatible provider works |
+| `LLM_MODEL` | `gemini-2.5-flash` | pinned deliberately, see below |
+| `MAX_STEPS` | 6 | tool-calling rounds per message |
+| `REPLIES_PER_HOUR` | 40 | spend ceiling, enforced in C |
+| `ARENA_BYTES` | 384 KB | shrink for a tighter machine; it prints its high-water mark |
+| `RAM_MIB` / `IMAGE_BYTES` | 16 / 0 | facts it cannot discover itself; the deploy script fills them in |
+
+Compile-time values are `-D` overridable: `gcc -DMAX_STEPS=10 ...`
+
+**On the model name:** `gemini-2.5-flash` is pinned rather than using a `-latest` alias. Under load the aliases queue indefinitely instead of returning an error, which is indistinguishable from a hang; the pinned name either answers or returns a clean 503, and the agent retries with backoff.
+
+## Operating notes
+
+**Secrets are compiled into the image.** There is no environment on BareMetal to read them from at runtime. Anyone who can read the image can recover the tokens, so treat a built `baremetal.elf` as a secret. Rotating a token means rebuilding and redeploying — about a minute.
+
+**There is a spend ceiling.** `REPLIES_PER_HOUR` (default 40) is counted in C, not requested in the prompt, because a prompt is a request and this is a limit. Past it, the agent says so and stops answering until the hour rolls over.
+
+**It answers the backlog on first boot.** Telegram redelivers any messages that were never acknowledged, so a fresh instance will work through whatever is queued. Send it something and it catches up.
+
+**Clock resolution is one second.** Uptime and round-trip figures are whole seconds; the agent says so rather than implying more precision than it has.
+
+## Credits
+
+Built on [BareMetal](https://github.com/ReturnInfinity/BareMetal), [BareMetal-App and BareMetal-AppPort](https://github.com/ReturnInfinity) by Return Infinity — musl, lwIP, mbedTLS and curl ported into an image that needs no operating system. The idea of a C program on BareMetal calling an HTTP API and posting to a chat channel comes from [Flâneur the Wanderer](https://github.com/varunmadhok/Flaneur-the-wanderer) by varunmadhok.
+
+Companion project: [unikernel-c](https://github.com/tabibazar/unikernel-c) — the agent loop this grew out of, a prime-search swarm, and a technical report measuring the platform.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,15 @@
+# build output
+/build/
+*.o
+*.elf
+*.app
+
+# BareMetal toolchain tree, if checked out here
+BareMetal-App/
+cjson/
+
+# never commit credentials
+.tg_token
+.gemini_key
+.bm_key
+.env
