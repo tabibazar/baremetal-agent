@@ -68,6 +68,8 @@ The first four report on the machine the agent is living inside, which is the po
 | `startup_timing` | how long it took from program start to its first completed HTTPS request |
 | `web_search` | the outside world, via [Firecrawl](https://firecrawl.dev) |
 | `read_page` | a page's main content as markdown, when a snippet is too thin |
+| `remember` | keeps one fact about the person it is talking to |
+| `recall` | everything it has kept about them |
 
 The two kinds of knowledge are kept visibly apart: facts about itself are measured
 at the moment you ask, while anything from the web is somebody else's claim and is
@@ -78,6 +80,46 @@ everything else in a 16 MiB machine.
 
 Web search is optional. Build without a Firecrawl key and the machine simply cannot
 see out, and says so rather than pretending.
+
+### Memory, on a machine with no disk
+
+BareMetal Cloud instances have no writable filesystem. `open(O_CREAT)` fails with `ENOENT` — `disktest.c` in this repo measures it, and the same binary on a local Firecracker run with a real 512 MB `disk.img` writes happily and the value survives a restart, so this is the platform rather than the program.
+
+So its memory lives a network round-trip away, behind the same HTTPS stack everything else uses: Redis with an [Upstash](https://upstash.com)-shaped REST interface. `kv_service.py` here is a self-hosted version of that interface if you would rather not sign up for anything; hosted Upstash works unchanged by swapping the URL and token.
+
+```
+you (before):  My name is Reza and I built you.
+bot:           It is good to meet you, Reza. I will remember that you built me.
+
+...restarted, redeployed, a different machine entirely...
+
+you (after):   who am I?
+bot:           You are Reza, my builder.
+```
+
+At boot it proves the path before anyone talks to it, which also happens to count restarts:
+
+```
+[+] web search: on   memory: on
+[+] memory reachable: this is boot #3, remembered across restarts
+```
+
+**The key is built in C, not chosen by the model.** Notes live under `agent:notes:<chat_id>`, taken from the message that arrived — so the model cannot name a key and therefore cannot read or write another person's notes, however it is asked. The list is trimmed to the last 20 entries per person. What it already knows is loaded before the model sees the message, so it recognises you without being told to check.
+
+Without credentials, memory is simply off and the agent says it has none rather than pretending.
+
+#### Self-hosting the store
+
+`kv_service.py` is a small HTTP front for a normal Redis, in the Upstash request shape:
+
+```sh
+sudo apt install -y redis-server python3-redis
+redis-cli config set appendonly yes && redis-cli config rewrite   # survive restarts
+openssl rand -hex 24 > ~/.kv_token
+KV_TOKEN=$(cat ~/.kv_token) python3 kv_service.py                 # listens on :8080
+```
+
+Put it behind TLS (any reverse proxy) and point `KV_URL` at it. Commands are allowlisted — `FLUSHALL`, `CONFIG`, `KEYS` and `SHUTDOWN` are refused — because the endpoint faces the internet and a leaked token should be able to touch keys, not reconfigure or wipe the server.
 
 ### Cold start, measured
 
@@ -90,6 +132,8 @@ On boot it prints, and will tell you if asked:
 That covers process start, network bring-up, DNS, TCP connect, the TLS handshake and the first HTTP response. It does **not** include the virtual machine booting before the program began — that is not visible from inside, and the tool says so rather than quietly claiming it.
 
 `time()` has one-second resolution, which is useless here, so the interval is measured with the CPU cycle counter. The counter has resolution but no unit, so its frequency is calibrated against a one-second sleep *after* the interval has already been recorded — measure first, learn the scale later, convert at the end. Calibrating up front would put a second of sleep inside the thing being measured. The result is rounded to 0.1 ms because the calibration, not the counter, is the limiting factor.
+
+The figure depends on which endpoint is contacted first. With memory enabled the first request is the boot-time memory check, and the number rose to about 1,700 ms; the 888 ms above was measured against `api.telegram.org`. It is the same measurement of a different first request, not a regression.
 
 For reference, the same source as an ordinary Linux process on a different host measured 876.5 ms. Different machines, so not a controlled comparison — but the two being within about 1% suggests this interval is dominated by DNS and TLS round-trips rather than by whatever is underneath.
 
@@ -225,6 +269,7 @@ Environment variables where there are any; the compile-time `#define`s otherwise
 | `TELEGRAM_BOT_TOKEN` | — | required |
 | `GEMINI_API_KEY` | — | required |
 | `FIRECRAWL_API_KEY` | — | optional; enables web search |
+| `KV_URL` / `KV_TOKEN` | — | optional; enables memory that survives restarts |
 | `LLM_BASE_URL` | Gemini's OpenAI-compatible endpoint | any compatible provider works |
 | `LLM_MODEL` | `gemini-2.5-flash` | pinned deliberately, see below |
 | `MAX_STEPS` | 6 | tool-calling rounds per message |

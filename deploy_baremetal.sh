@@ -38,6 +38,11 @@ bake() {   # bake <image_bytes>
     if [ -f "$HOME/.firecrawl_key" ]; then
         sed -i "s|PUT_FIRECRAWL_KEY_HERE|$(cat "$HOME/.firecrawl_key")|" bmagent.c
     fi
+    # Memory: any Redis with an Upstash-shaped REST interface.
+    if [ -f "$HOME/.kv_url" ] && [ -f "$HOME/.kv_token" ]; then
+        sed -i "s|PUT_KV_URL_HERE|$(cat "$HOME/.kv_url")|" bmagent.c
+        sed -i "s|PUT_KV_TOKEN_HERE|$(cat "$HOME/.kv_token")|" bmagent.c
+    fi
     sed -i "s|^#define RAM_MIB         16$|#define RAM_MIB         ${RAM_MIB}|" bmagent.c
     sed -i "s|^#define IMAGE_BYTES     0 |#define IMAGE_BYTES     ${1} |" bmagent.c
 }

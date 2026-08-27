@@ -52,6 +52,15 @@
 #define GEMINI_KEY_DEFAULT     "PUT_GEMINI_KEY_HERE"
 #define FIRECRAWL_KEY_DEFAULT  "PUT_FIRECRAWL_KEY_HERE"   // optional: enables web search
 
+// Where this machine keeps its memory. BareMetal Cloud instances have no
+// writable filesystem -- open(O_CREAT) fails with ENOENT, verified -- so notes
+// cannot live locally. They live a network round-trip away instead, behind the
+// same HTTPS stack everything else uses. Any Redis with an Upstash-shaped REST
+// interface works; the URL and token are the only things that change.
+#define KV_URL_DEFAULT         "PUT_KV_URL_HERE"
+#define KV_TOKEN_DEFAULT       "PUT_KV_TOKEN_HERE"
+#define NOTES_KEPT             20        // per person, oldest dropped
+
 // Firecrawl returns pages as markdown, so this program never parses HTML —
 // which is the only reason reading the web is tractable inside a fixed buffer.
 #define SEARCH_URL "https://api.firecrawl.dev/v2/search"
@@ -232,7 +241,10 @@ static const char *http_post_json(const char *url, const char *body, const char 
 // ---------------------------------------------------------------- config lookup
 
 static const char *g_tg_token, *g_llm_key, *g_llm_url, *g_llm_model, *g_fc_key;
+static const char *g_kv_url, *g_kv_token;
 static int g_web_enabled;          // false when no Firecrawl key was supplied
+static int g_memory_enabled;       // false when no KV credentials were supplied
+static long long g_current_chat;   // whose notes the memory tools may touch
 static time_t g_booted;
 
 // ---------------------------------------------------------------- startup timing
@@ -308,6 +320,16 @@ static const char *TOOLS_JSON =
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"ping_api\","
 "     \"description\":\"Measure a real HTTPS round-trip from this machine, including the TLS handshake. Use when asked about speed or networking.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"remember\","
+"     \"description\":\"Keep one fact about the person you are talking to, so you still have it after you are restarted. Use it when they tell you something worth keeping.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{"
+"        \"fact\":{\"type\":\"string\",\"description\":\"One short fact, in your own words.\"}},"
+"        \"required\":[\"fact\"]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"recall\","
+"     \"description\":\"Everything you have kept about the person you are talking to.\","
 "     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"startup_timing\","
@@ -598,12 +620,134 @@ static void tool_startup_timing(void) {
     cJSON_Delete(o);
 }
 
+// One Redis command over HTTPS. Returns the parsed reply, or NULL. The caller
+// owns nothing: everything lands in the arena.
+static cJSON *kv_command(cJSON *argv) {
+    if (!g_memory_enabled) return NULL;
+    if (!cJSON_PrintPreallocated(argv, g_payload, (int)sizeof(g_payload), 0)) return NULL;
+
+    char auth[512];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", g_kv_token);
+    long status = 0;
+    const char *resp = http_post_json(g_kv_url, g_payload, auth, &status);
+    if (!resp || status >= 400) {
+        fprintf(stderr, "[!] memory: HTTP %ld\n", status);
+        return NULL;
+    }
+    return cJSON_Parse(resp);
+}
+
+// The key is built here from the chat the message arrived in. The model never
+// supplies it and cannot name one, so it cannot read or write another person's
+// notes however it is asked to.
+static void notes_key(char *out, size_t n) {
+    snprintf(out, n, "agent:notes:%lld", g_current_chat);
+}
+
+static void tool_remember(const cJSON *args) {
+    if (!g_memory_enabled) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"this machine has no memory configured, and no disk to fall "
+                 "back on. Say so plainly.\"}");
+        return;
+    }
+    cJSON *f = cJSON_GetObjectItemCaseSensitive(args, "fact");
+    if (!cJSON_IsString(f) || !*f->valuestring) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"nothing to remember\"}");
+        return;
+    }
+    char key[64];
+    notes_key(key, sizeof(key));
+
+    cJSON *cmd = cJSON_CreateArray();
+    if (!cmd) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("RPUSH"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(key));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(f->valuestring));
+    cJSON *reply = kv_command(cmd);
+    if (!reply) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"could not reach my memory\"}");
+        return;
+    }
+
+    // Keep only the most recent notes, so one talkative person cannot grow the
+    // list without bound.
+    char lo[16];
+    snprintf(lo, sizeof(lo), "-%d", NOTES_KEPT);
+    cJSON *trim = cJSON_CreateArray();
+    if (trim) {
+        cJSON_AddItemToArray(trim, cJSON_CreateString("LTRIM"));
+        cJSON_AddItemToArray(trim, cJSON_CreateString(key));
+        cJSON_AddItemToArray(trim, cJSON_CreateString(lo));
+        cJSON_AddItemToArray(trim, cJSON_CreateString("-1"));
+        kv_command(trim);
+    }
+    snprintf(g_result, sizeof(g_result),
+             "{\"ok\":true,\"note\":\"kept; it will still be here after I am restarted\"}");
+}
+
+// Reads this chat's notes into g_result. Also used to preload a conversation.
+static int load_notes(char *out, size_t out_sz) {
+    if (!g_memory_enabled) return 0;
+    char key[64];
+    notes_key(key, sizeof(key));
+
+    cJSON *cmd = cJSON_CreateArray();
+    if (!cmd) return 0;
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("LRANGE"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(key));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("0"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("-1"));
+
+    cJSON *reply = kv_command(cmd);
+    if (!reply) return 0;
+    cJSON *res = cJSON_GetObjectItemCaseSensitive(reply, "result");
+    if (!cJSON_IsArray(res) || cJSON_GetArraySize(res) == 0) return 0;
+
+    size_t o = 0;
+    cJSON *it = NULL;
+    cJSON_ArrayForEach(it, res) {
+        if (!cJSON_IsString(it)) continue;
+        int w = snprintf(out + o, out_sz - o, "%s- %s", o ? "\n" : "", it->valuestring);
+        if (w < 0 || (size_t)w >= out_sz - o) break;
+        o += (size_t)w;
+    }
+    return o > 0;
+}
+
+static void tool_recall(void) {
+    if (!g_memory_enabled) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"no memory configured\"}");
+        return;
+    }
+    char notes[3000];
+    if (!load_notes(notes, sizeof(notes))) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"notes\":[],\"note\":\"nothing remembered about this person yet\"}");
+        return;
+    }
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddStringToObject(o, "notes", notes);
+    cJSON_AddStringToObject(o, "stored_in",
+        "Redis, reached over HTTPS. This machine has no disk, so anything it keeps lives "
+        "on the network.");
+    if (!cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"result did not fit\"}");
+    cJSON_Delete(o);
+}
+
 static void call_tool(const char *name, const cJSON *args) {
     if      (strcmp(name, "machine_facts") == 0) tool_machine_facts();
     else if (strcmp(name, "memory_usage")  == 0) tool_memory_usage();
     else if (strcmp(name, "build_info")    == 0) tool_build_info();
     else if (strcmp(name, "ping_api")      == 0) tool_ping_api();
     else if (strcmp(name, "startup_timing") == 0) tool_startup_timing();
+    else if (strcmp(name, "recall")        == 0) tool_recall();
+    else if (strcmp(name, "remember") == 0) {
+        if (args) tool_remember(args);
+        else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
+    }
     else if (strcmp(name, "web_search") == 0) {
         if (args) tool_web_search(args);
         else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
@@ -628,6 +772,10 @@ static void call_tool(const char *name, const cJSON *args) {
     "Keep the two kinds of knowledge visibly apart: things about yourself are measured " \
     "here and now, things from the web are somebody else's claim, and you should say which " \
     "you are giving and include the url when it came from the web.\n\n" \
+    "You have a memory that survives being restarted, kept on another machine because " \
+    "you have no disk of your own. When someone tells you something worth keeping about " \
+    "themselves, keep it. What you already know about them is given to you before their " \
+    "message, so use it naturally rather than announcing that you looked.\n\n" \
     "Never announce that you are about to use a tool — just use it, and then answer. " \
     "Saying 'I need to search for that' and stopping leaves the person with nothing, " \
     "because they cannot see your tools; all they get is the sentence.\n\n" \
@@ -750,6 +898,20 @@ static void answer(long long chat_id, const char *question, const char *who, int
     cJSON *messages = cJSON_CreateArray();
     if (!messages) return;
     add_message(messages, "system", SYSTEM_PROMPT);
+
+    // What is already known about this person, fetched before the model sees
+    // the question, so it recognises them without having to be asked to check.
+    if (g_memory_enabled) {
+        char notes[3000];
+        if (load_notes(notes, sizeof(notes))) {
+            char preface[3200];
+            snprintf(preface, sizeof(preface),
+                     "What you already know about the person you are talking to, from your "
+                     "memory:\n%s\n\nUse it naturally. Do not recite it back at them.", notes);
+            add_message(messages, "system", preface);
+        }
+    }
+
     add_message(messages, "user", question);
 
     const char *final = NULL;
@@ -844,6 +1006,7 @@ static void poll_once(void) {
         snprintf(who, sizeof(who), "%s", cJSON_IsString(name) ? name->valuestring : "someone");
 
         printf("[*] %s: %s\n", who, question);
+        g_current_chat = chat_id;
 
         if (!budget_allows()) {
             send_message(chat_id,
@@ -865,11 +1028,14 @@ int main(int argc, char **argv) {
     g_llm_url   = env_or("LLM_BASE_URL", LLM_URL_DEFAULT);
     g_llm_model = env_or("LLM_MODEL", LLM_MODEL_DEFAULT);
     g_fc_key    = env_or("FIRECRAWL_API_KEY", FIRECRAWL_KEY_DEFAULT);
+    g_kv_url    = env_or("KV_URL", KV_URL_DEFAULT);
+    g_kv_token  = env_or("KV_TOKEN", KV_TOKEN_DEFAULT);
     g_booted    = time(NULL);
 
     // Web search is optional: without a key the machine simply cannot see out,
     // and says so rather than pretending.
-    g_web_enabled = (strncmp(g_fc_key, "fc-", 3) == 0);
+    g_web_enabled    = (strncmp(g_fc_key, "fc-", 3) == 0);
+    g_memory_enabled = (strncmp(g_kv_url, "https://", 8) == 0 && strlen(g_kv_token) > 8);
 
     // Validate by shape, not by comparing against the defaults: a BareMetal
     // build bakes the real values INTO those defaults, so comparing would
@@ -899,7 +1065,29 @@ int main(int argc, char **argv) {
     printf("[+] BareMetal agent up. model=%s ram=%d MiB static=%d KB max_steps=%d\n",
            g_llm_model, RAM_MIB,
            (ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES) / 1024, MAX_STEPS);
+    printf("[+] web search: %s   memory: %s\n",
+           g_web_enabled ? "on" : "off", g_memory_enabled ? "on" : "off");
+
+    // Prove the memory path at boot rather than discovering it is broken during
+    // a conversation. INCR also happens to count restarts, which is the most
+    // direct demonstration there is that this survives the machine dying.
+    if (g_memory_enabled) {
+        cJSON *cmd = cJSON_CreateArray();
+        if (cmd) {
+            cJSON_AddItemToArray(cmd, cJSON_CreateString("INCR"));
+            cJSON_AddItemToArray(cmd, cJSON_CreateString("agent:boots"));
+            cJSON *reply = kv_command(cmd);
+            cJSON *res = reply ? cJSON_GetObjectItemCaseSensitive(reply, "result") : NULL;
+            if (cJSON_IsNumber(res))
+                printf("[+] memory reachable: this is boot #%d, remembered across restarts\n",
+                       (int)res->valuedouble);
+            else
+                printf("[!] memory configured but unreachable — notes will not be kept\n");
+            arena_reset();
+        }
+    }
     if (ask) {
+        g_current_chat = 0;               // a scratch identity for local testing
         printf("[*] test question: %s\n", ask);
         answer(0, ask, "the terminal", 0);
         curl_global_cleanup();
