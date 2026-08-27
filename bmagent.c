@@ -60,6 +60,11 @@
 #define KV_URL_DEFAULT         "PUT_KV_URL_HERE"
 #define KV_TOKEN_DEFAULT       "PUT_KV_TOKEN_HERE"
 #define NOTES_KEPT             20        // per person, oldest dropped
+#define REMINDERS_KEY          "agent:reminders"   // sorted set, scored by due time
+#define REMINDER_MAX_PER_CHAT  20
+#define REMINDER_MIN_DELAY     20        // seconds; below this it is a typo
+#define REMINDER_MAX_HORIZON   (90L * 24 * 3600)
+#define REMINDER_CHECK_EVERY   60        // seconds between due-checks
 
 // Firecrawl returns pages as markdown, so this program never parses HTML —
 // which is the only reason reading the web is tractable inside a fixed buffer.
@@ -327,6 +332,17 @@ static const char *TOOLS_JSON =
 "     \"parameters\":{\"type\":\"object\",\"properties\":{"
 "        \"fact\":{\"type\":\"string\",\"description\":\"One short fact, in your own words.\"}},"
 "        \"required\":[\"fact\"]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"remind_me\","
+"     \"description\":\"Send this person a message at a future time. Give the absolute time as Unix epoch seconds; the current time is in your context, so work it out from there. Say back what you set and when, in their words.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{"
+"        \"at_unix\":{\"type\":\"integer\",\"description\":\"When to send it, Unix epoch seconds.\"},"
+"        \"text\":{\"type\":\"string\",\"description\":\"What to remind them about, in their words.\"}},"
+"        \"required\":[\"at_unix\",\"text\"]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"list_reminders\","
+"     \"description\":\"The reminders currently set for this person, with when each is due.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"recall\","
 "     \"description\":\"Everything you have kept about the person you are talking to.\","
@@ -737,6 +753,189 @@ static void tool_recall(void) {
     cJSON_Delete(o);
 }
 
+static int send_message(long long chat_id, const char *text);   // defined below
+
+// Reminders live in one sorted set scored by due time, so "what is due" is a
+// single range query. The payload carries the chat, because the delivery loop
+// has no other way to know where a reminder should go.
+static void tool_remind_me(const cJSON *args) {
+    if (!g_memory_enabled) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"no memory configured, so nothing can be kept for later\"}");
+        return;
+    }
+    cJSON *at = cJSON_GetObjectItemCaseSensitive(args, "at_unix");
+    cJSON *tx = cJSON_GetObjectItemCaseSensitive(args, "text");
+    if (!cJSON_IsNumber(at) || !cJSON_IsString(tx) || !*tx->valuestring) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"need at_unix and text\"}");
+        return;
+    }
+
+    long now = (long)time(NULL);
+    long due = (long)at->valuedouble;
+    if (due < now + REMINDER_MIN_DELAY) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"that time is now or in the past. The current epoch is %ld.\"}", now);
+        return;
+    }
+    if (due > now + REMINDER_MAX_HORIZON) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"further ahead than I keep reminders (90 days)\"}");
+        return;
+    }
+
+    // A cap per person, counted here. Someone should not be able to fill the
+    // store by asking nicely.
+    cJSON *count = cJSON_CreateArray();
+    if (count) {
+        cJSON_AddItemToArray(count, cJSON_CreateString("ZCARD"));
+        cJSON_AddItemToArray(count, cJSON_CreateString(REMINDERS_KEY));
+        cJSON *rep = kv_command(count);
+        cJSON *res = rep ? cJSON_GetObjectItemCaseSensitive(rep, "result") : NULL;
+        if (cJSON_IsNumber(res) && res->valuedouble >= REMINDER_MAX_PER_CHAT * 20) {
+            snprintf(g_result, sizeof(g_result), "{\"error\":\"my reminder list is full\"}");
+            return;
+        }
+    }
+
+    // member = {"chat":<id>,"text":"..."} — unique enough that two identical
+    // reminders at the same second collapse into one, which is the right answer.
+    cJSON *member = cJSON_CreateObject();
+    if (!member) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddNumberToObject(member, "chat", (double)g_current_chat);
+    cJSON_AddNumberToObject(member, "due", (double)due);
+    char clipped[600];
+    snprintf(clipped, sizeof(clipped), "%s", tx->valuestring);
+    cJSON_AddStringToObject(member, "text", clipped);
+    char payload[800];
+    if (!cJSON_PrintPreallocated(member, payload, (int)sizeof(payload), 0)) {
+        cJSON_Delete(member);
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"that reminder is too long\"}");
+        return;
+    }
+    cJSON_Delete(member);
+
+    char score[24];
+    snprintf(score, sizeof(score), "%ld", due);
+    cJSON *cmd = cJSON_CreateArray();
+    if (!cmd) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("ZADD"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(REMINDERS_KEY));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(score));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(payload));
+
+    if (!kv_command(cmd)) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"could not reach my memory\"}");
+        return;
+    }
+    snprintf(g_result, sizeof(g_result),
+             "{\"ok\":true,\"due_unix\":%ld,\"in_seconds\":%ld,\"note\":\"kept where I keep "
+             "everything, so a restart will not lose it\"}", due, due - now);
+}
+
+static void tool_list_reminders(void) {
+    if (!g_memory_enabled) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"no memory configured\"}");
+        return;
+    }
+    cJSON *cmd = cJSON_CreateArray();
+    if (!cmd) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("ZRANGE"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(REMINDERS_KEY));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("0"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("-1"));
+
+    cJSON *rep = kv_command(cmd);
+    cJSON *res = rep ? cJSON_GetObjectItemCaseSensitive(rep, "result") : NULL;
+    if (!cJSON_IsArray(res)) {
+        snprintf(g_result, sizeof(g_result), "{\"reminders\":[]}");
+        return;
+    }
+
+    // Filtered here rather than in the query: the store holds everyone's
+    // reminders, and this person may only see their own.
+    cJSON *mine = cJSON_CreateArray();
+    cJSON *it = NULL;
+    long now = (long)time(NULL);
+    cJSON_ArrayForEach(it, res) {
+        if (!cJSON_IsString(it)) continue;
+        cJSON *m = cJSON_Parse(it->valuestring);
+        if (!m) continue;
+        cJSON *chat = cJSON_GetObjectItemCaseSensitive(m, "chat");
+        cJSON *due  = cJSON_GetObjectItemCaseSensitive(m, "due");
+        cJSON *text = cJSON_GetObjectItemCaseSensitive(m, "text");
+        if (cJSON_IsNumber(chat) && (long long)chat->valuedouble == g_current_chat &&
+            cJSON_IsString(text) && mine) {
+            cJSON *o = cJSON_CreateObject();
+            if (o) {
+                cJSON_AddStringToObject(o, "text", text->valuestring);
+                if (cJSON_IsNumber(due))
+                    cJSON_AddNumberToObject(o, "in_seconds", (double)((long)due->valuedouble - now));
+                cJSON_AddItemToArray(mine, o);
+            }
+        }
+        cJSON_Delete(m);
+    }
+
+    cJSON *out = cJSON_CreateObject();
+    if (out && mine) cJSON_AddItemToObject(out, "reminders", mine);
+    if (!out || !cJSON_PrintPreallocated(out, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"could not list them\"}");
+    cJSON_Delete(out);
+}
+
+// Delivers anything now due, straight from C. No model call: the text was
+// written when the reminder was set, and paying for a round of inference to
+// repeat it back would be waste.
+static void deliver_due_reminders(void) {
+    if (!g_memory_enabled) return;
+    long now = (long)time(NULL);
+    char now_s[24];
+    snprintf(now_s, sizeof(now_s), "%ld", now);
+
+    arena_reset();
+    cJSON *cmd = cJSON_CreateArray();
+    if (!cmd) return;
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("ZRANGEBYSCORE"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(REMINDERS_KEY));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString("-inf"));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(now_s));
+
+    cJSON *rep = kv_command(cmd);
+    cJSON *res = rep ? cJSON_GetObjectItemCaseSensitive(rep, "result") : NULL;
+    if (!cJSON_IsArray(res) || cJSON_GetArraySize(res) == 0) return;
+
+    cJSON *it = NULL;
+    cJSON_ArrayForEach(it, res) {
+        if (!cJSON_IsString(it)) continue;
+        char raw[900];
+        snprintf(raw, sizeof(raw), "%s", it->valuestring);
+
+        cJSON *m = cJSON_Parse(raw);
+        if (!m) continue;
+        cJSON *chat = cJSON_GetObjectItemCaseSensitive(m, "chat");
+        cJSON *text = cJSON_GetObjectItemCaseSensitive(m, "text");
+        if (cJSON_IsNumber(chat) && cJSON_IsString(text)) {
+            char msg[900];
+            snprintf(msg, sizeof(msg), "\xE2\x8F\xB0 Reminder: %s", text->valuestring);
+            long long to = (long long)chat->valuedouble;
+            printf("[*] reminder due for chat %lld: %s\n", to, text->valuestring);
+            send_message(to, msg);
+        }
+        cJSON_Delete(m);
+
+        // Remove it whether or not the send worked. A reminder that fails to
+        // deliver and stays queued would be retried forever, every minute.
+        cJSON *rm = cJSON_CreateArray();
+        if (rm) {
+            cJSON_AddItemToArray(rm, cJSON_CreateString("ZREM"));
+            cJSON_AddItemToArray(rm, cJSON_CreateString(REMINDERS_KEY));
+            cJSON_AddItemToArray(rm, cJSON_CreateString(raw));
+            kv_command(rm);
+        }
+    }
+}
+
 static void call_tool(const char *name, const cJSON *args) {
     if      (strcmp(name, "machine_facts") == 0) tool_machine_facts();
     else if (strcmp(name, "memory_usage")  == 0) tool_memory_usage();
@@ -744,6 +943,11 @@ static void call_tool(const char *name, const cJSON *args) {
     else if (strcmp(name, "ping_api")      == 0) tool_ping_api();
     else if (strcmp(name, "startup_timing") == 0) tool_startup_timing();
     else if (strcmp(name, "recall")        == 0) tool_recall();
+    else if (strcmp(name, "list_reminders") == 0) tool_list_reminders();
+    else if (strcmp(name, "remind_me") == 0) {
+        if (args) tool_remind_me(args);
+        else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
+    }
     else if (strcmp(name, "remember") == 0) {
         if (args) tool_remember(args);
         else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
@@ -772,6 +976,9 @@ static void call_tool(const char *name, const cJSON *args) {
     "Keep the two kinds of knowledge visibly apart: things about yourself are measured " \
     "here and now, things from the web are somebody else's claim, and you should say which " \
     "you are giving and include the url when it came from the web.\n\n" \
+    "You can also set reminders for people, which are delivered even if you are restarted " \
+    "in the meantime. When someone asks to be reminded, work out the absolute time from the " \
+    "current time given to you and set it; do not ask them to give you a timestamp.\n\n" \
     "You have a memory that survives being restarted, kept on another machine because " \
     "you have no disk of your own. When someone tells you something worth keeping about " \
     "themselves, keep it. What you already know about them is given to you before their " \
@@ -898,6 +1105,23 @@ static void answer(long long chat_id, const char *question, const char *who, int
     cJSON *messages = cJSON_CreateArray();
     if (!messages) return;
     add_message(messages, "system", SYSTEM_PROMPT);
+
+    // The current time, so that "tomorrow morning" can become a number. Without
+    // this the model has no idea when now is, and quietly guesses.
+    {
+        time_t now = time(NULL);
+        char when[220];
+        struct tm *g = gmtime(&now);
+        if (g)
+            snprintf(when, sizeof(when),
+                     "The current time is %04d-%02d-%02d %02d:%02d UTC, which is Unix epoch "
+                     "second %ld. Use it for anything time-related.",
+                     g->tm_year + 1900, g->tm_mon + 1, g->tm_mday, g->tm_hour, g->tm_min,
+                     (long)now);
+        else
+            snprintf(when, sizeof(when), "The current Unix epoch second is %ld.", (long)now);
+        add_message(messages, "system", when);
+    }
 
     // What is already known about this person, fetched before the model sees
     // the question, so it recognises them without having to be asked to check.
@@ -1087,7 +1311,10 @@ int main(int argc, char **argv) {
         }
     }
     if (ask) {
-        g_current_chat = 0;               // a scratch identity for local testing
+        // A real chat id if one is configured, so a reminder set from the
+        // terminal is actually deliverable; otherwise a scratch identity.
+        const char *test_chat = getenv("TELEGRAM_CHAT_ID");
+        g_current_chat = (test_chat && *test_chat) ? strtoll(test_chat, NULL, 10) : 0;
         printf("[*] test question: %s\n", ask);
         answer(0, ask, "the terminal", 0);
         curl_global_cleanup();
@@ -1097,8 +1324,16 @@ int main(int argc, char **argv) {
     printf("[+] waiting for messages\n");
 
     int timing_printed = 0;
+    time_t last_reminder_check = 0;
     do {
         poll_once();
+
+        // On its own clock: every poll would mean a store round-trip every few
+        // seconds forever, for something a minute of latency does not hurt.
+        if (g_memory_enabled && time(NULL) - last_reminder_check >= REMINDER_CHECK_EVERY) {
+            last_reminder_check = time(NULL);
+            deliver_due_reminders();
+        }
 
         // Report the cold-start figure to the console once the first request has
         // completed, so it is visible without anyone having to ask for it.

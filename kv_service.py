@@ -37,6 +37,9 @@ ALLOWED = {
     "RPUSH", "LPUSH", "LRANGE", "LLEN", "LTRIM", "LPOP", "RPOP",
     "HSET", "HGET", "HGETALL", "HDEL",
     "SADD", "SMEMBERS", "SREM",
+    # Sorted sets: reminders are kept scored by when they come due, so "what is
+    # due now" is one range query rather than a scan of everything.
+    "ZADD", "ZRANGEBYSCORE", "ZRANGE", "ZREM", "ZCARD", "ZSCORE",
 }
 
 r = redis.Redis(host="127.0.0.1", port=6379, decode_responses=True)

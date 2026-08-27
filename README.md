@@ -70,6 +70,8 @@ The first four report on the machine the agent is living inside, which is the po
 | `read_page` | a page's main content as markdown, when a snippet is too thin |
 | `remember` | keeps one fact about the person it is talking to |
 | `recall` | everything it has kept about them |
+| `remind_me` | sends them a message at a future time, surviving restarts |
+| `list_reminders` | what they have pending, and when each is due |
 
 The two kinds of knowledge are kept visibly apart: facts about itself are measured
 at the moment you ask, while anything from the web is somebody else's claim and is
@@ -107,6 +109,18 @@ At boot it proves the path before anyone talks to it, which also happens to coun
 **The key is built in C, not chosen by the model.** Notes live under `agent:notes:<chat_id>`, taken from the message that arrived — so the model cannot name a key and therefore cannot read or write another person's notes, however it is asked. The list is trimmed to the last 20 entries per person. What it already knows is loaded before the model sees the message, so it recognises you without being told to check.
 
 Without credentials, memory is simply off and the agent says it has none rather than pretending.
+
+#### Reminders
+
+Ask it to remind you and it works out the absolute time, stores the reminder scored by when it comes due, and delivers it — even if the machine is rebuilt and redeployed in between. Delivery is a range query on its own timer, once a minute, sent straight from C: the text was written when the reminder was set, so paying for a round of inference to repeat it back would be waste.
+
+The reminder that proved it was set from a laptop and delivered by the unikernel, which learned of its existence only by asking what was due:
+
+```
+[*] reminder due for chat 106265108: to check the reminder feature
+```
+
+Two details worth knowing. **The chat is taken from C**, never from the model, so a reminder cannot be aimed at someone else. And **the model's clock is not trusted**: on the first attempt it produced a timestamp from December 2023, recalled from training, which the range check refused with the actual epoch — and it corrected itself. The current time is given to it explicitly on every message for the same reason.
 
 #### Self-hosting the store
 
