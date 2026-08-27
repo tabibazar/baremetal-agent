@@ -71,6 +71,38 @@ INSTANCE_ID=$(./bm-api.sh instances create "$NAME" 1 "$RAM_MIB" "$IMAGE_ID" | aw
 echo "instance id: $INSTANCE_ID"
 echo "$INSTANCE_ID" > "$HOME/.bmagent_instance"
 
+# Retire older instances of the same name only AFTER the new one exists, so a
+# failed deploy leaves the previous one serving rather than nothing at all.
+echo "=== retiring previous instances ==="
+# Deleting an instance is refused unless it has actually reached STOPPED, and
+# stopping is not instant -- so wait for the state rather than sleeping and
+# hoping. Two instances left running would both poll Telegram and steal each
+# other's messages, so this failing quietly is worse than it failing loudly.
+./bm-api.sh instances list 2>/dev/null | awk -v n="$NAME" -v keep="$INSTANCE_ID" \
+    '$2 == n && $1 != keep {print $1}' | while read -r old; do
+    ./bm-api.sh instances stop "$old" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        state=$(./bm-api.sh instances show "$old" 2>/dev/null | awk -F': ' '/^status:/{print $2}')
+        [ "$state" = "STOPPED" ] && break
+        sleep 2
+    done
+    if ./bm-api.sh instances rm "$old" >/dev/null 2>&1; then
+        echo "  retired $old"
+    else
+        echo "  WARNING: could not retire $old (state=$state) — it is still polling" >&2
+    fi
+done || true
+
+# Only now are the old images unreferenced. The account allows ten, and every
+# redeploy adds one, so without this a deploy eventually fails at the upload
+# step. Failures here are ignored on purpose: an image still in use should stay,
+# and a tidy-up problem must never fail a deploy that already succeeded.
+echo "=== pruning unused images named $NAME ==="
+./bm-api.sh images list 2>/dev/null | awk -v n="$NAME" -v keep="$IMAGE_ID" \
+    '$2 == n && $1 != keep {print $1}' | while read -r old; do
+    if ./bm-api.sh images rm "$old" >/dev/null 2>&1; then echo "  removed $old"; fi
+done || true
+
 echo
 echo "It is live. Text the bot; the reply comes from the unikernel."
 echo "Serial console:  ./bm-api.sh instances logs $INSTANCE_ID"

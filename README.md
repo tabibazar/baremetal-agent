@@ -120,7 +120,9 @@ The reminder that proved it was set from a laptop and delivered by the unikernel
 [*] reminder due for chat 106265108: to check the reminder feature
 ```
 
-Two details worth knowing. **The chat is taken from C**, never from the model, so a reminder cannot be aimed at someone else. And **the model's clock is not trusted**: on the first attempt it produced a timestamp from December 2023, recalled from training, which the range check refused with the actual epoch — and it corrected itself. The current time is given to it explicitly on every message for the same reason.
+**The tool takes a delay, not a timestamp**, and that detail turned out to matter. The first version asked the model for absolute Unix epoch seconds. It failed roughly half the time with `finish_reason=MALFORMED_FUNCTION_CALL` — an empty reply, no tool call, no error — and when it did emit a timestamp it was sometimes recalled from training data (December 2023) rather than computed. Switching the parameter to `in_seconds`, a small number the model gets right, took five consecutive runs to five clean successes. The clock arithmetic belongs in C anyway.
+
+**The chat is taken from C**, never from the model, so a reminder cannot be aimed at someone else. An empty reply is retried twice with an explanation before giving up, rather than surfacing "something went wrong" to the person.
 
 #### Self-hosting the store
 

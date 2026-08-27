@@ -334,11 +334,11 @@ static const char *TOOLS_JSON =
 "        \"required\":[\"fact\"]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"remind_me\","
-"     \"description\":\"Send this person a message at a future time. Give the absolute time as Unix epoch seconds; the current time is in your context, so work it out from there. Say back what you set and when, in their words.\","
+"     \"description\":\"Send this person a message at a future time. Say how far ahead in seconds — 3600 for an hour, 86400 for a day. Then tell them what you set, in their words.\","
 "     \"parameters\":{\"type\":\"object\",\"properties\":{"
-"        \"at_unix\":{\"type\":\"integer\",\"description\":\"When to send it, Unix epoch seconds.\"},"
+"        \"in_seconds\":{\"type\":\"integer\",\"description\":\"How long from now, in seconds.\"},"
 "        \"text\":{\"type\":\"string\",\"description\":\"What to remind them about, in their words.\"}},"
-"        \"required\":[\"at_unix\",\"text\"]}}},"
+"        \"required\":[\"in_seconds\",\"text\"]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"list_reminders\","
 "     \"description\":\"The reminders currently set for this person, with when each is due.\","
@@ -764,15 +764,21 @@ static void tool_remind_me(const cJSON *args) {
                  "{\"error\":\"no memory configured, so nothing can be kept for later\"}");
         return;
     }
-    cJSON *at = cJSON_GetObjectItemCaseSensitive(args, "at_unix");
+    // A delay, not a timestamp. Asking the model for absolute epoch seconds
+    // made it do clock arithmetic and emit a ten-digit literal, and it produced
+    // a MALFORMED_FUNCTION_CALL about half the time — as well as timestamps
+    // recalled from its training data. A small relative number is something it
+    // gets right, and the clock arithmetic belongs here anyway.
+    cJSON *in = cJSON_GetObjectItemCaseSensitive(args, "in_seconds");
+    cJSON *at = cJSON_GetObjectItemCaseSensitive(args, "at_unix");   // still accepted
     cJSON *tx = cJSON_GetObjectItemCaseSensitive(args, "text");
-    if (!cJSON_IsNumber(at) || !cJSON_IsString(tx) || !*tx->valuestring) {
-        snprintf(g_result, sizeof(g_result), "{\"error\":\"need at_unix and text\"}");
+    if ((!cJSON_IsNumber(in) && !cJSON_IsNumber(at)) || !cJSON_IsString(tx) || !*tx->valuestring) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"need in_seconds and text\"}");
         return;
     }
 
     long now = (long)time(NULL);
-    long due = (long)at->valuedouble;
+    long due = cJSON_IsNumber(in) ? now + (long)in->valuedouble : (long)at->valuedouble;
     if (due < now + REMINDER_MIN_DELAY) {
         snprintf(g_result, sizeof(g_result),
                  "{\"error\":\"that time is now or in the past. The current epoch is %ld.\"}", now);
@@ -1041,8 +1047,25 @@ static cJSON *llm_attempt(const cJSON *messages, int *retryable) {
     cJSON *choices = cJSON_GetObjectItemCaseSensitive(json, "choices");
     cJSON *msg = NULL;
     if (cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-        cJSON *m = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(choices, 0), "message");
+        cJSON *choice = cJSON_GetArrayItem(choices, 0);
+        cJSON *m = cJSON_GetObjectItemCaseSensitive(choice, "message");
         if (m) msg = cJSON_Duplicate(m, 1);
+
+        // When a reply carries neither text nor a tool call, the reason is in
+        // finish_reason and nowhere else. Gemini answers MALFORMED_FUNCTION_CALL
+        // this way — it tried to call a tool, produced something unparseable,
+        // and returned an empty message rather than an error.
+        if (m) {
+            cJSON *c  = cJSON_GetObjectItemCaseSensitive(m, "content");
+            cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+            int empty = (!cJSON_IsString(c) || !*c->valuestring) &&
+                        (!cJSON_IsArray(tc) || cJSON_GetArraySize(tc) == 0);
+            if (empty) {
+                cJSON *fr = cJSON_GetObjectItemCaseSensitive(choice, "finish_reason");
+                fprintf(stderr, "[!] empty reply from the model, finish_reason=%s\n",
+                        cJSON_IsString(fr) ? fr->valuestring : "(absent)");
+            }
+        }
     }
     cJSON_Delete(json);
     return msg;
@@ -1139,6 +1162,7 @@ static void answer(long long chat_id, const char *question, const char *who, int
     add_message(messages, "user", question);
 
     const char *final = NULL;
+    int empty_replies = 0;
 
     for (int step = 1; step <= MAX_STEPS; step++) {
         cJSON *assistant = llm_turn(messages);
@@ -1151,7 +1175,23 @@ static void answer(long long chat_id, const char *question, const char *who, int
         cJSON *content = cJSON_GetObjectItemCaseSensitive(assistant, "content");
 
         if (!cJSON_IsArray(calls) || cJSON_GetArraySize(calls) == 0) {
-            if (cJSON_IsString(content) && *content->valuestring) final = content->valuestring;
+            if (cJSON_IsString(content) && *content->valuestring) {
+                final = content->valuestring;
+                break;
+            }
+            // Neither text nor a tool call. Rather than give up on the person,
+            // say what came back and ask for the answer in plain words; a
+            // malformed tool call is usually not repeated on the second try.
+            if (++empty_replies <= 2) {
+                fprintf(stderr, "    [~] empty reply, asking again (%d)\n", empty_replies);
+                add_message(messages, "user",
+                    "Your last reply came back empty, which happens when a tool call is "
+                    "malformed. Try the same call again with plain literal values — never "
+                    "an expression or a calculation — or if that fails, just answer in "
+                    "words. Do not ask the person for timestamps or other internal values; "
+                    "that is your job, not theirs.");
+                continue;
+            }
             break;
         }
 
