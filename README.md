@@ -4,7 +4,7 @@ An LLM agent you can text, running as a [BareMetal](https://github.com/ReturnInf
 
 There is no operating system under this program. No kernel, no init, no shell, no filesystem it depends on — the image *is* the machine. Inside it: an agent loop with tool calling, a TLS 1.3 client, a TCP/IP stack, and enough room left to hold a conversation. All of it in **16 MiB of RAM**, from a **2.87 MB** image.
 
-Text the bot and you are talking to that.
+A live one is running at **[@unikernel_bot](https://t.me/unikernel_bot)** — text it and you are talking to that.
 
 ```
 you:  how much memory are you using right now, and what is under you?
