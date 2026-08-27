@@ -295,6 +295,8 @@ Compile-time values are `-D` overridable: `gcc -DMAX_STEPS=10 ...`
 
 Built on [BareMetal](https://github.com/ReturnInfinity/BareMetal), [BareMetal-App and BareMetal-AppPort](https://github.com/ReturnInfinity) by Return Infinity — musl, lwIP, mbedTLS and curl ported into an image that needs no operating system. The idea of a C program on BareMetal calling an HTTP API and posting to a chat channel comes from [Flâneur the Wanderer](https://github.com/varunmadhok/Flaneur-the-wanderer) by varunmadhok.
 
+New to unikernels? [**The Program Is the Machine**](https://github.com/tabibazar/unikernel-c/blob/main/docs/unikernels-explained.html) explains what exokernels and unikernels are, what a unikernel removes that a container does not, and what all of this measured — this agent is its worked example.
+
 Companion project: [unikernel-c](https://github.com/tabibazar/unikernel-c) — the agent loop this grew out of, a prime-search swarm, and a technical report measuring the platform.
 
 ## License
