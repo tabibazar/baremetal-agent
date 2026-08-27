@@ -7,8 +7,10 @@
 #
 #   BM_API_KEY=bmvps_...  bash deploy_baremetal.sh
 #
-# Reads:  ~/.tg_token      Telegram bot token
-#         ~/.gemini_key    model API key
+# Reads:  ~/.tg_token       Telegram bot token
+#         ~/.gemini_key     model API key
+#         ~/.firecrawl_key  search/scrape key (optional; omit for a machine that
+#                           can only talk about itself)
 set -eu
 
 : "${BM_API_KEY:?set BM_API_KEY — create one at https://baremetal.returninfinity.com/dashboard}"
@@ -33,6 +35,9 @@ bake() {   # bake <image_bytes>
     cp "$SRC" bmagent.c
     sed -i "s|PUT_BOT_TOKEN_HERE|$(cat "$HOME/.tg_token")|" bmagent.c
     sed -i "s|PUT_GEMINI_KEY_HERE|$(cat "$HOME/.gemini_key")|" bmagent.c
+    if [ -f "$HOME/.firecrawl_key" ]; then
+        sed -i "s|PUT_FIRECRAWL_KEY_HERE|$(cat "$HOME/.firecrawl_key")|" bmagent.c
+    fi
     sed -i "s|^#define RAM_MIB         16$|#define RAM_MIB         ${RAM_MIB}|" bmagent.c
     sed -i "s|^#define IMAGE_BYTES     0 |#define IMAGE_BYTES     ${1} |" bmagent.c
 }

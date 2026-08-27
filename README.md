@@ -2,7 +2,7 @@
 
 An LLM agent you can text, running as a [BareMetal](https://github.com/ReturnInfinity) unikernel.
 
-There is no operating system under this program. No kernel, no init, no shell, no filesystem it depends on — the image *is* the machine. Inside it: an agent loop with tool calling, a TLS 1.3 client, a TCP/IP stack, and enough room left to hold a conversation. All of it in **16 MiB of RAM**, from a **2.87 MB** image.
+There is no operating system under this program. No kernel, no init, no shell, no filesystem it depends on — the image *is* the machine. Inside it: an agent loop with tool calling, a TLS 1.3 client, a TCP/IP stack, and enough room left to hold a conversation. All of it in **16 MiB of RAM**, from a **2.88 MB** image.
 
 A live one is running at **[@unikernel_bot](https://t.me/unikernel_bot)** — text it and you are talking to that.
 
@@ -14,7 +14,20 @@ bot:  I am currently using 10,400 bytes of memory within my arena.
       hardware with no operating system or kernel beneath me.
 ```
 
-Every number it gives you is measured at the moment you ask. It has no way to state a figure except by calling a tool that reads it.
+Every number it gives you about itself is measured at the moment you ask — it has no way to state one except by calling a tool that reads it. It can also search the web, and it keeps the difference explicit:
+
+```
+you:  what is the latest release version of Firecracker,
+      and what are you running on?
+
+bot:  The latest release version of Firecracker is v1.16.1, according
+      to its GitHub releases page at https://github.com/firecracker-
+      microvm/firecracker/releases.
+
+      I am running on BareMetal-AppPort. I am linked directly against
+      the hardware and do not have an operating system, kernel, or
+      other typical software layers beneath me.
+```
 
 ## Why this is interesting
 
@@ -22,10 +35,10 @@ Agent frameworks generally assume a language runtime, a garbage collector, a con
 
 | | |
 |---|---|
-| Image size | 2,875,584 bytes |
+| Image size | 2,883,040 bytes |
 | RAM | 16 MiB (the platform's per-instance ceiling) |
-| Static footprint | 640 KB — arena 384 KB, HTTP 128 KB, payload 128 KB |
-| Arena used for a typical answer | 8–35 KB |
+| Static footprint | 768 KB — arena 384 KB, HTTP 256 KB, payload 128 KB |
+| Arena used for a typical answer | 8–54 KB (the upper end with web results in context) |
 | Heap allocations | none — the allocator is compiled out |
 | Inside the image | musl, lwIP, mbedTLS, libcurl, cJSON, Mozilla CA bundle |
 | Not inside the image | operating system, kernel, init, shell, package manager, language runtime |
@@ -44,7 +57,7 @@ The conversation array is the agent's whole memory for one exchange, and the are
 
 ### The tools
 
-All four report on the machine the agent is living inside, which is the point: the subject is the platform, not the model.
+The first four report on the machine the agent is living inside, which is the point: the subject is the platform, not the model. The last two let it answer questions about the world.
 
 | Tool | Answers |
 |---|---|
@@ -52,6 +65,18 @@ All four report on the machine the agent is living inside, which is the point: t
 | `memory_usage` | live arena use and high-water mark, read from its own allocator |
 | `build_info` | what is linked into the image, and what is absent |
 | `ping_api` | a real HTTPS round-trip, timed now, TLS handshake included |
+| `web_search` | the outside world, via [Firecrawl](https://firecrawl.dev) |
+| `read_page` | a page's main content as markdown, when a snippet is too thin |
+
+The two kinds of knowledge are kept visibly apart: facts about itself are measured
+at the moment you ask, while anything from the web is somebody else's claim and is
+cited with its URL. Reading is confined to hosts a search result came from, so it
+cannot wander onto a domain it invented, and pages are clipped to 5 KB — the whole
+conversation is re-sent on every turn, and an untrimmed page would crowd out
+everything else in a 16 MiB machine.
+
+Web search is optional. Build without a Firecrawl key and the machine simply cannot
+see out, and says so rather than pretending.
 
 ### Zero heap, by construction
 
@@ -77,11 +102,14 @@ The same source builds for Linux, macOS and BareMetal. Start with an ordinary bu
 
 **Model API key.** A Gemini key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) (free tier is fine). Any OpenAI-compatible provider works — see [Configuration](#configuration).
 
+**Search key (optional).** A [Firecrawl](https://firecrawl.dev) key enables `web_search` and `read_page`. Without one the agent can still talk about itself.
+
 Keep them in files rather than in your shell history:
 
 ```sh
 printf '%s' '8123456789:AAH...' > ~/.tg_token   && chmod 600 ~/.tg_token
-printf '%s' 'AIza...'           > ~/.gemini_key && chmod 600 ~/.gemini_key
+printf '%s' 'AIza...'           > ~/.gemini_key    && chmod 600 ~/.gemini_key
+printf '%s' 'fc-...'            > ~/.firecrawl_key && chmod 600 ~/.firecrawl_key
 ```
 
 ### 2 · Build and run on Linux or macOS
@@ -140,6 +168,7 @@ mkdir -p cjson && cp cjson_src/cJSON.c cjson_src/cJSON.h cjson/ && rm -rf cjson_
 cp /path/to/baremetal-agent/bmagent.c .
 sed -i "s|PUT_BOT_TOKEN_HERE|$(cat ~/.tg_token)|"   bmagent.c
 sed -i "s|PUT_GEMINI_KEY_HERE|$(cat ~/.gemini_key)|" bmagent.c
+sed -i "s|PUT_FIRECRAWL_KEY_HERE|$(cat ~/.firecrawl_key)|" bmagent.c   # optional
 ```
 
 **Build the image:**
@@ -148,7 +177,7 @@ sed -i "s|PUT_GEMINI_KEY_HERE|$(cat ~/.gemini_key)|" bmagent.c
 ./1-build.sh bmagent.c cjson/cJSON.c
 ```
 
-That produces `baremetal.elf` — a complete bootable machine, around 2.87 MB.
+That produces `baremetal.elf` — a complete bootable machine, around 2.88 MB.
 
 **Run it locally** under Firecracker (needs `firecracker` on PATH, and a tap device for networking — `BareMetal-Firecracker/scripts/mkbr0.sh` sets one up, but read it first: on a wired single-NIC host it moves your host IP onto a bridge and will disconnect a remote session):
 
@@ -178,6 +207,7 @@ Environment variables where there are any; the compile-time `#define`s otherwise
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | required |
 | `GEMINI_API_KEY` | — | required |
+| `FIRECRAWL_API_KEY` | — | optional; enables web search |
 | `LLM_BASE_URL` | Gemini's OpenAI-compatible endpoint | any compatible provider works |
 | `LLM_MODEL` | `gemini-2.5-flash` | pinned deliberately, see below |
 | `MAX_STEPS` | 6 | tool-calling rounds per message |

@@ -50,6 +50,12 @@
 
 #define TELEGRAM_TOKEN_DEFAULT "PUT_BOT_TOKEN_HERE"
 #define GEMINI_KEY_DEFAULT     "PUT_GEMINI_KEY_HERE"
+#define FIRECRAWL_KEY_DEFAULT  "PUT_FIRECRAWL_KEY_HERE"   // optional: enables web search
+
+// Firecrawl returns pages as markdown, so this program never parses HTML —
+// which is the only reason reading the web is tractable inside a fixed buffer.
+#define SEARCH_URL "https://api.firecrawl.dev/v2/search"
+#define SCRAPE_URL "https://api.firecrawl.dev/v2/scrape"
 
 #define LLM_URL_DEFAULT   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 // Pinned deliberately: the "-latest" aliases queue indefinitely under load
@@ -60,7 +66,11 @@
 #define ARENA_BYTES     (384 * 1024)
 #endif
 #ifndef HTTP_BUF_BYTES
-#define HTTP_BUF_BYTES  (128 * 1024)
+// 256 KB rather than 128: Firecrawl returns a whole page as markdown, and a
+// long page's JSON overflows a 128 KB buffer. Overflow is handled (the fetch
+// fails cleanly) but it would fail often, and the extra 128 KB is nothing
+// against 16 MiB.
+#define HTTP_BUF_BYTES  (256 * 1024)
 #endif
 #ifndef PAYLOAD_BYTES
 #define PAYLOAD_BYTES   (128 * 1024)
@@ -215,7 +225,8 @@ static const char *http_post_json(const char *url, const char *body, const char 
 
 // ---------------------------------------------------------------- config lookup
 
-static const char *g_tg_token, *g_llm_key, *g_llm_url, *g_llm_model;
+static const char *g_tg_token, *g_llm_key, *g_llm_url, *g_llm_model, *g_fc_key;
+static int g_web_enabled;          // false when no Firecrawl key was supplied
 static time_t g_booted;
 
 static const char *env_or(const char *name, const char *fallback) {
@@ -246,10 +257,63 @@ static const char *TOOLS_JSON =
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"ping_api\","
 "     \"description\":\"Measure a real HTTPS round-trip from this machine, including the TLS handshake. Use when asked about speed or networking.\","
-"     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}}"
+"     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"web_search\","
+"     \"description\":\"Search the web. Use for anything about the outside world — this machine cannot know such things by itself. Returns title, url and a short description.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{"
+"        \"query\":{\"type\":\"string\",\"description\":\"The search query.\"}},"
+"        \"required\":[\"query\"]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"read_page\","
+"     \"description\":\"Read the main content of a page found by web_search, when the description is too thin to answer. The url must be on a site a search result came from.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{"
+"        \"url\":{\"type\":\"string\",\"description\":\"The page to read.\"}},"
+"        \"required\":[\"url\"]}}}"
 "]";
 
-static char g_result[4096];
+// Large enough to carry a clipped page back to the model.
+static char g_result[12288];
+#define PAGE_CAP       5000
+#define SEARCH_RESULTS 5
+#define DESC_CAP       240
+
+// Hosts that search actually surfaced this conversation. Reading is confined to
+// them, so the agent cannot wander onto a domain it invented — while still being
+// free to navigate within a site it legitimately found.
+#define MAX_HOSTS 16
+static char g_hosts[MAX_HOSTS][128];
+static int  g_host_count;
+
+static void url_host(const char *u, char *out, size_t n) {
+    out[0] = '\0';
+    const char *p = strstr(u, "://");
+    if (!p) return;
+    p += 3;
+    const char *slash = strchr(p, '/');
+    size_t len = slash ? (size_t)(slash - p) : strlen(p);
+    if (len >= n) len = n - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
+
+static void remember_host(const char *url) {
+    char h[128];
+    url_host(url, h, sizeof(h));
+    if (!*h || g_host_count >= MAX_HOSTS) return;
+    for (int i = 0; i < g_host_count; i++)
+        if (strcmp(g_hosts[i], h) == 0) return;
+    snprintf(g_hosts[g_host_count++], 128, "%s", h);
+}
+
+static int host_allowed(const char *url) {
+    char h[128];
+    url_host(url, h, sizeof(h));
+    if (!*h) return 0;
+    for (int i = 0; i < g_host_count; i++)
+        if (strcmp(g_hosts[i], h) == 0) return 1;
+    return 0;
+}
 
 static void tool_machine_facts(void) {
     long up = (long)(time(NULL) - g_booted);
@@ -310,11 +374,149 @@ static void tool_ping_api(void) {
         status, dt, r ? "true" : "false");
 }
 
-static void call_tool(const char *name) {
+static void tool_web_search(const cJSON *args) {
+    if (!g_web_enabled) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"this machine was built without a search key, so it has no way "
+                 "to see the outside world. Say so plainly.\"}");
+        return;
+    }
+    cJSON *q = cJSON_GetObjectItemCaseSensitive(args, "query");
+    if (!cJSON_IsString(q)) { snprintf(g_result, sizeof(g_result), "{\"error\":\"missing query\"}"); return; }
+
+    cJSON *req = cJSON_CreateObject();
+    if (!req) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddStringToObject(req, "query", q->valuestring);
+    cJSON_AddNumberToObject(req, "limit", SEARCH_RESULTS);
+    int ok = cJSON_PrintPreallocated(req, g_payload, (int)sizeof(g_payload), 0);
+    cJSON_Delete(req);
+    if (!ok) { snprintf(g_result, sizeof(g_result), "{\"error\":\"could not build request\"}"); return; }
+
+    char auth[256];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", g_fc_key);
+    long status = 0;
+    const char *resp = http_post_json(SEARCH_URL, g_payload, auth, &status);
+    if (!resp || status >= 400) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"search failed (HTTP %ld)\"}", status);
+        return;
+    }
+
+    cJSON *json = cJSON_Parse(resp);
+    if (!json) { snprintf(g_result, sizeof(g_result), "{\"error\":\"search returned unparseable JSON\"}"); return; }
+
+    // v2 nests results under data.web; v1 returns a flat data array.
+    cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
+    cJSON *web  = data ? cJSON_GetObjectItemCaseSensitive(data, "web") : NULL;
+    cJSON *list = cJSON_IsArray(web) ? web : (cJSON_IsArray(data) ? data : NULL);
+
+    cJSON *out = cJSON_CreateArray();
+    int kept = 0;
+    if (out && list) {
+        cJSON *r = NULL;
+        cJSON_ArrayForEach(r, list) {
+            if (kept >= SEARCH_RESULTS) break;
+            cJSON *u = cJSON_GetObjectItemCaseSensitive(r, "url");
+            cJSON *t = cJSON_GetObjectItemCaseSensitive(r, "title");
+            cJSON *d = cJSON_GetObjectItemCaseSensitive(r, "description");
+            if (!cJSON_IsString(u)) continue;
+
+            remember_host(u->valuestring);
+
+            cJSON *slim = cJSON_CreateObject();
+            if (!slim) break;
+            cJSON_AddStringToObject(slim, "url", u->valuestring);
+            if (cJSON_IsString(t)) cJSON_AddStringToObject(slim, "title", t->valuestring);
+            if (cJSON_IsString(d)) {
+                char desc[DESC_CAP + 1];
+                snprintf(desc, sizeof(desc), "%s", d->valuestring);
+                cJSON_AddStringToObject(slim, "description", desc);
+            }
+            cJSON_AddItemToArray(out, slim);
+            kept++;
+        }
+    }
+    cJSON_Delete(json);
+
+    if (!out || !cJSON_PrintPreallocated(out, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"results did not fit\"}");
+    cJSON_Delete(out);
+}
+
+static void tool_read_page(const cJSON *args) {
+    if (!g_web_enabled) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"no search key in this build\"}");
+        return;
+    }
+    cJSON *u = cJSON_GetObjectItemCaseSensitive(args, "url");
+    if (!cJSON_IsString(u)) { snprintf(g_result, sizeof(g_result), "{\"error\":\"missing url\"}"); return; }
+
+    if (!host_allowed(u->valuestring)) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"that url is on a site no search result came from; search first\"}");
+        return;
+    }
+
+    cJSON *req = cJSON_CreateObject();
+    if (!req) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddStringToObject(req, "url", u->valuestring);
+    cJSON *fmts = cJSON_CreateArray();
+    cJSON_AddItemToArray(fmts, cJSON_CreateString("markdown"));
+    cJSON_AddItemToObject(req, "formats", fmts);
+    cJSON_AddBoolToObject(req, "onlyMainContent", 1);
+    int ok = cJSON_PrintPreallocated(req, g_payload, (int)sizeof(g_payload), 0);
+    cJSON_Delete(req);
+    if (!ok) { snprintf(g_result, sizeof(g_result), "{\"error\":\"could not build request\"}"); return; }
+
+    char auth[256];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", g_fc_key);
+    long status = 0;
+    const char *resp = http_post_json(SCRAPE_URL, g_payload, auth, &status);
+    if (!resp || status >= 400) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"could not fetch that page (HTTP %ld); it may be too large for "
+                 "this machine's buffer\"}", status);
+        return;
+    }
+
+    cJSON *json = cJSON_Parse(resp);
+    if (!json) { snprintf(g_result, sizeof(g_result), "{\"error\":\"page returned unparseable JSON\"}"); return; }
+    cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
+    cJSON *md   = data ? cJSON_GetObjectItemCaseSensitive(data, "markdown") : NULL;
+    if (!cJSON_IsString(md)) {
+        cJSON_Delete(json);
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"no readable content there\"}");
+        return;
+    }
+
+    // Clipped hard: the conversation is re-sent on every subsequent turn, so an
+    // untrimmed page would crowd out everything else in a 16 MiB machine.
+    cJSON *o = cJSON_CreateObject();
+    if (o) {
+        char clipped[PAGE_CAP + 1];
+        snprintf(clipped, sizeof(clipped), "%s", md->valuestring);
+        cJSON_AddStringToObject(o, "url", u->valuestring);
+        cJSON_AddStringToObject(o, "content", clipped);
+        cJSON_AddBoolToObject(o, "truncated", strlen(md->valuestring) > PAGE_CAP);
+    }
+    cJSON_Delete(json);
+
+    if (!o || !cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"page did not fit\"}");
+    cJSON_Delete(o);
+}
+
+static void call_tool(const char *name, const cJSON *args) {
     if      (strcmp(name, "machine_facts") == 0) tool_machine_facts();
     else if (strcmp(name, "memory_usage")  == 0) tool_memory_usage();
     else if (strcmp(name, "build_info")    == 0) tool_build_info();
     else if (strcmp(name, "ping_api")      == 0) tool_ping_api();
+    else if (strcmp(name, "web_search") == 0) {
+        if (args) tool_web_search(args);
+        else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
+    } else if (strcmp(name, "read_page") == 0) {
+        if (args) tool_read_page(args);
+        else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
+    }
     else snprintf(g_result, sizeof(g_result), "{\"error\":\"no such tool: %.40s\"}", name);
 }
 
@@ -325,9 +527,16 @@ static void call_tool(const char *name) {
     "operating system beneath it, on one virtual CPU with 16 MiB of RAM. You are not " \
     "describing that machine from outside — you ARE it. Speak in the first person about " \
     "yourself.\n\n" \
-    "Every number you give must come from a tool call. Never estimate, never recall a " \
-    "figure from training, and never round a measurement into a nicer one. If a tool " \
-    "cannot tell you something, say you do not know.\n\n" \
+    "Every number you give about YOURSELF must come from a tool call. Never estimate, " \
+    "never recall a figure from training, and never round a measurement into a nicer one. " \
+    "If a tool cannot tell you something, say you do not know.\n\n" \
+    "You can also search the web and read pages, for questions about the outside world. " \
+    "Keep the two kinds of knowledge visibly apart: things about yourself are measured " \
+    "here and now, things from the web are somebody else's claim, and you should say which " \
+    "you are giving and include the url when it came from the web.\n\n" \
+    "Never announce that you are about to use a tool — just use it, and then answer. " \
+    "Saying 'I need to search for that' and stopping leaves the person with nothing, " \
+    "because they cannot see your tools; all they get is the sentence.\n\n" \
     "Keep replies short — two or three sentences is usually right, and this is a chat " \
     "window. Be plain and concrete rather than promotional; the facts are impressive on " \
     "their own and do not need selling. No markdown formatting, since it will be sent as " \
@@ -473,8 +682,13 @@ static void answer(long long chat_id, const char *question, const char *who, int
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
             if (!cJSON_IsString(nm)) continue;
 
-            printf("    -> %s\n", nm->valuestring);
-            call_tool(nm->valuestring);
+            cJSON *ar = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+            cJSON *parsed = cJSON_IsString(ar) ? cJSON_Parse(ar->valuestring) : NULL;
+
+            printf("    -> %s %.100s\n", nm->valuestring,
+                   cJSON_IsString(ar) ? ar->valuestring : "");
+            call_tool(nm->valuestring, parsed);
+            if (parsed) cJSON_Delete(parsed);
 
             cJSON *tm = cJSON_CreateObject();
             if (!tm) break;
@@ -555,7 +769,12 @@ int main(int argc, char **argv) {
     g_llm_key   = env_or("GEMINI_API_KEY", GEMINI_KEY_DEFAULT);
     g_llm_url   = env_or("LLM_BASE_URL", LLM_URL_DEFAULT);
     g_llm_model = env_or("LLM_MODEL", LLM_MODEL_DEFAULT);
+    g_fc_key    = env_or("FIRECRAWL_API_KEY", FIRECRAWL_KEY_DEFAULT);
     g_booted    = time(NULL);
+
+    // Web search is optional: without a key the machine simply cannot see out,
+    // and says so rather than pretending.
+    g_web_enabled = (strncmp(g_fc_key, "fc-", 3) == 0);
 
     // Validate by shape, not by comparing against the defaults: a BareMetal
     // build bakes the real values INTO those defaults, so comparing would
