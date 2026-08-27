@@ -65,6 +65,7 @@ The first four report on the machine the agent is living inside, which is the po
 | `memory_usage` | live arena use and high-water mark, read from its own allocator |
 | `build_info` | what is linked into the image, and what is absent |
 | `ping_api` | a real HTTPS round-trip, timed now, TLS handshake included |
+| `startup_timing` | how long it took from program start to its first completed HTTPS request |
 | `web_search` | the outside world, via [Firecrawl](https://firecrawl.dev) |
 | `read_page` | a page's main content as markdown, when a snippet is too thin |
 
@@ -77,6 +78,22 @@ everything else in a 16 MiB machine.
 
 Web search is optional. Build without a Firecrawl key and the machine simply cannot
 see out, and says so rather than pretending.
+
+### Cold start, measured
+
+On boot it prints, and will tell you if asked:
+
+```
+[+] startup: program start -> first HTTPS (TLS included) in 888.4 ms
+```
+
+That covers process start, network bring-up, DNS, TCP connect, the TLS handshake and the first HTTP response. It does **not** include the virtual machine booting before the program began — that is not visible from inside, and the tool says so rather than quietly claiming it.
+
+`time()` has one-second resolution, which is useless here, so the interval is measured with the CPU cycle counter. The counter has resolution but no unit, so its frequency is calibrated against a one-second sleep *after* the interval has already been recorded — measure first, learn the scale later, convert at the end. Calibrating up front would put a second of sleep inside the thing being measured. The result is rounded to 0.1 ms because the calibration, not the counter, is the limiting factor.
+
+For reference, the same source as an ordinary Linux process on a different host measured 876.5 ms. Different machines, so not a controlled comparison — but the two being within about 1% suggests this interval is dominated by DNS and TLS round-trips rather than by whatever is underneath.
+
+On a non-x86 build the cycle counter is unavailable and it falls back to the one-second clock, reporting that it did.
 
 ### Zero heap, by construction
 

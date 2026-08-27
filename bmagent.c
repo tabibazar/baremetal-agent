@@ -150,6 +150,10 @@ static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
 
 // ---------------------------------------------------------------- http
 
+// Defined with the startup-timing code below; the HTTP helpers call it so that
+// the first completed request is stamped wherever it happens to occur.
+static void mark_first_tls(void);
+
 static void set_ca_bundle(CURL *h) {
     FILE *f = fopen(CA_BUNDLE_PATH, "r");
     if (f) {
@@ -191,6 +195,7 @@ static const char *http_get(const char *url, long *status_out) {
                 g_sink.overflow ? " (response exceeded HTTP_BUF_BYTES)" : "");
         return NULL;
     }
+    mark_first_tls();
     return g_http;
 }
 
@@ -220,6 +225,7 @@ static const char *http_post_json(const char *url, const char *body, const char 
         fprintf(stderr, "[!] POST: %s\n", curl_easy_strerror(res));
         return NULL;
     }
+    mark_first_tls();
     return g_http;
 }
 
@@ -228,6 +234,51 @@ static const char *http_post_json(const char *url, const char *body, const char 
 static const char *g_tg_token, *g_llm_key, *g_llm_url, *g_llm_model, *g_fc_key;
 static int g_web_enabled;          // false when no Firecrawl key was supplied
 static time_t g_booted;
+
+// ---------------------------------------------------------------- startup timing
+//
+// time() here has one-second resolution, which is useless for a cold start. The
+// cycle counter has the resolution; what it lacks is a unit, so its frequency is
+// calibrated once against a one-second sleep AFTER the interesting interval has
+// already been recorded. Measure first, learn the scale later, convert at the
+// end — calibrating up front would put a second of sleep inside the very thing
+// being measured.
+
+static uint64_t g_tsc_entry, g_tsc_first_tls, g_tsc_hz;
+static int      g_first_tls_seen;
+
+static uint64_t cycles(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
+#else
+    // Non-x86 (a macOS arm64 build, say): fall back to seconds. The tool reports
+    // the resolution it had, so a coarse number is never passed off as a fine one.
+    return (uint64_t)time(NULL);
+#endif
+}
+
+static int cycles_are_fine_grained(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static void mark_first_tls(void) {
+    if (!g_first_tls_seen) {
+        g_tsc_first_tls = cycles();
+        g_first_tls_seen = 1;
+    }
+}
+
+static void calibrate_cycles(void) {
+    if (!cycles_are_fine_grained()) { g_tsc_hz = 1; return; }
+    uint64_t a = cycles();
+    sleep(1);
+    uint64_t b = cycles();
+    g_tsc_hz = (b > a) ? (b - a) : 0;
+}
 
 static const char *env_or(const char *name, const char *fallback) {
     const char *v = getenv(name);
@@ -257,6 +308,10 @@ static const char *TOOLS_JSON =
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"ping_api\","
 "     \"description\":\"Measure a real HTTPS round-trip from this machine, including the TLS handshake. Use when asked about speed or networking.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"startup_timing\","
+"     \"description\":\"How long this machine took from the program starting to its first completed HTTPS request, TLS handshake included. Measured with the CPU cycle counter. Use when asked about boot time, cold start, or how fast it started.\","
 "     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"web_search\","
@@ -505,11 +560,50 @@ static void tool_read_page(const cJSON *args) {
     cJSON_Delete(o);
 }
 
+static void tool_startup_timing(void) {
+    if (!g_first_tls_seen) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"no request has completed yet, so there is nothing to report\"}");
+        return;
+    }
+    // Calibrated on demand. The interval being reported was recorded long before
+    // this point, so the one-second sleep cannot contaminate it.
+    if (!g_tsc_hz) calibrate_cycles();
+    if (!g_tsc_hz) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"could not calibrate the counter\"}");
+        return;
+    }
+    double secs = (double)(g_tsc_first_tls - g_tsc_entry) / (double)g_tsc_hz;
+
+    // Rounded to a tenth of a millisecond. The counter has far more resolution
+    // than that, but the calibration against a one-second sleep does not, and
+    // quoting fourteen decimal places would be claiming precision we never had.
+    double ms = (double)((long)(secs * 10000.0 + 0.5)) / 10.0;
+
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddNumberToObject(o, "ms_from_program_start_to_first_https", ms);
+    cJSON_AddStringToObject(o, "precision", "rounded to 0.1 ms; the calibration is the limit");
+    cJSON_AddStringToObject(o, "measured_with",
+        cycles_are_fine_grained() ? "CPU cycle counter, calibrated against a one-second sleep"
+                                  : "one-second clock only (not an x86 build)");
+    cJSON_AddNumberToObject(o, "counter_hz", (double)g_tsc_hz);
+    cJSON_AddStringToObject(o, "includes",
+        "process start, network bring-up, DNS, TCP connect, TLS handshake, first HTTP response");
+    cJSON_AddStringToObject(o, "excludes",
+        "the virtual machine booting before this program began. That part is not visible "
+        "from in here, so do not claim it as part of the figure.");
+    if (!cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"result did not fit\"}");
+    cJSON_Delete(o);
+}
+
 static void call_tool(const char *name, const cJSON *args) {
     if      (strcmp(name, "machine_facts") == 0) tool_machine_facts();
     else if (strcmp(name, "memory_usage")  == 0) tool_memory_usage();
     else if (strcmp(name, "build_info")    == 0) tool_build_info();
     else if (strcmp(name, "ping_api")      == 0) tool_ping_api();
+    else if (strcmp(name, "startup_timing") == 0) tool_startup_timing();
     else if (strcmp(name, "web_search") == 0) {
         if (args) tool_web_search(args);
         else snprintf(g_result, sizeof(g_result), "{\"error\":\"bad arguments\"}");
@@ -763,6 +857,7 @@ static void poll_once(void) {
 }
 
 int main(int argc, char **argv) {
+    g_tsc_entry = cycles();          // first statement: everything after is measured
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     g_tg_token  = env_or("TELEGRAM_BOT_TOKEN", TELEGRAM_TOKEN_DEFAULT);
@@ -813,8 +908,23 @@ int main(int argc, char **argv) {
 
     printf("[+] waiting for messages\n");
 
+    int timing_printed = 0;
     do {
         poll_once();
+
+        // Report the cold-start figure to the console once the first request has
+        // completed, so it is visible without anyone having to ask for it.
+        if (!timing_printed && g_first_tls_seen) {
+            timing_printed = 1;
+            if (!g_tsc_hz) calibrate_cycles();
+            if (g_tsc_hz) {
+                double secs = (double)(g_tsc_first_tls - g_tsc_entry) / (double)g_tsc_hz;
+                printf("[+] startup: program start -> first HTTPS (TLS included) in %.1f ms%s\n",
+                       secs * 1000.0,
+                       cycles_are_fine_grained() ? "" : "  (one-second clock: coarse)");
+            }
+        }
+
         if (!once) sleep(POLL_SECONDS);
     } while (!once);
 
