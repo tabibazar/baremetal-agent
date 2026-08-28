@@ -36,7 +36,7 @@ ALLOWED = {
     "PING", "GET", "SET", "SETEX", "DEL", "EXISTS", "INCR", "EXPIRE", "TTL",
     "RPUSH", "LPUSH", "LRANGE", "LLEN", "LTRIM", "LPOP", "RPOP",
     "HSET", "HGET", "HGETALL", "HDEL",
-    "SADD", "SMEMBERS", "SREM",
+    "SADD", "SMEMBERS", "SREM", "SCARD",
     # Sorted sets: reminders are kept scored by when they come due, so "what is
     # due now" is one range query rather than a scan of everything.
     "ZADD", "ZRANGEBYSCORE", "ZRANGE", "ZREM", "ZCARD", "ZSCORE",

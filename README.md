@@ -72,6 +72,7 @@ The first four report on the machine the agent is living inside, which is the po
 | `recall` | everything it has kept about them |
 | `remind_me` | sends them a message at a future time, surviving restarts |
 | `list_reminders` | what they have pending, and when each is due |
+| `usage_stats` | messages answered, different people, restarts — counted across all of them |
 
 The two kinds of knowledge are kept visibly apart: facts about itself are measured
 at the moment you ask, while anything from the web is somebody else's claim and is
@@ -136,6 +137,12 @@ KV_TOKEN=$(cat ~/.kv_token) python3 kv_service.py                 # listens on :
 ```
 
 Put it behind TLS (any reverse proxy) and point `KV_URL` at it. Commands are allowlisted — `FLUSHALL`, `CONFIG`, `KEYS` and `SHUTDOWN` are refused — because the endpoint faces the internet and a leaked token should be able to touch keys, not reconfigure or wipe the server.
+
+### /start answered without a model
+
+`/start` is the first thing almost everyone sends, and `/help` the second. Both are answered directly in C: no inference, no wait, and the same words every time — none of which is true of letting the model improvise an introduction for each new person.
+
+`./build/bmagent --help-text` sends that introduction to the configured chat, so you can read it as a stranger will read it before anyone is shown it.
 
 ### Cold start, measured
 

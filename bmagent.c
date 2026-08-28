@@ -65,6 +65,8 @@
 #define REMINDER_MIN_DELAY     20        // seconds; below this it is a typo
 #define REMINDER_MAX_HORIZON   (90L * 24 * 3600)
 #define REMINDER_CHECK_EVERY   60        // seconds between due-checks
+#define STATS_MESSAGES_KEY     "agent:stats:messages"
+#define STATS_PEOPLE_KEY       "agent:stats:people"
 
 // Firecrawl returns pages as markdown, so this program never parses HTML —
 // which is the only reason reading the web is tractable inside a fixed buffer.
@@ -350,6 +352,10 @@ static const char *TOOLS_JSON =
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"recall\","
 "     \"description\":\"Everything you have kept about the person you are talking to.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"usage_stats\","
+"     \"description\":\"How much this machine has been used: messages answered, how many different people have talked to it, and how many times it has been restarted. Counted across every restart, not just this one.\","
 "     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"startup_timing\","
@@ -759,6 +765,42 @@ static void tool_recall(void) {
 
 static int send_message(long long chat_id, const char *text);   // defined below
 
+// One small integer reply from the store, or fallback on any trouble. Used for
+// counters, where a missing value and a zero mean the same thing.
+static long kv_number(const char *cmd_name, const char *key, long fallback) {
+    if (!g_memory_enabled) return fallback;
+    cJSON *cmd = cJSON_CreateArray();
+    if (!cmd) return fallback;
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(cmd_name));
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(key));
+    cJSON *rep = kv_command(cmd);
+    cJSON *res = rep ? cJSON_GetObjectItemCaseSensitive(rep, "result") : NULL;
+    if (cJSON_IsNumber(res)) return (long)res->valuedouble;
+    if (cJSON_IsString(res)) return strtol(res->valuestring, NULL, 10);
+    return fallback;
+}
+
+// Counted after a reply actually went out, so the number means "answers given"
+// rather than "messages seen".
+static void bump_usage(long long chat) {
+    if (!g_memory_enabled) return;
+    cJSON *inc = cJSON_CreateArray();
+    if (inc) {
+        cJSON_AddItemToArray(inc, cJSON_CreateString("INCR"));
+        cJSON_AddItemToArray(inc, cJSON_CreateString(STATS_MESSAGES_KEY));
+        kv_command(inc);
+    }
+    char who[32];
+    snprintf(who, sizeof(who), "%lld", chat);
+    cJSON *add = cJSON_CreateArray();
+    if (add) {
+        cJSON_AddItemToArray(add, cJSON_CreateString("SADD"));
+        cJSON_AddItemToArray(add, cJSON_CreateString(STATS_PEOPLE_KEY));
+        cJSON_AddItemToArray(add, cJSON_CreateString(who));
+        kv_command(add);
+    }
+}
+
 // Reminders live in one sorted set scored by due time, so "what is due" is a
 // single range query. The payload carries the chat, because the delivery loop
 // has no other way to know where a reminder should go.
@@ -946,12 +988,37 @@ static void deliver_due_reminders(void) {
     }
 }
 
+static void tool_usage_stats(void) {
+    if (!g_memory_enabled) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"no memory configured, so nothing has been counted\"}");
+        return;
+    }
+    long msgs   = kv_number("GET",   STATS_MESSAGES_KEY, 0);
+    long people = kv_number("SCARD", STATS_PEOPLE_KEY,   0);
+    long boots  = kv_number("GET",   "agent:boots",      0);
+
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON_AddNumberToObject(o, "messages_answered", (double)msgs);
+    cJSON_AddNumberToObject(o, "different_people", (double)people);
+    cJSON_AddNumberToObject(o, "times_restarted", (double)boots);
+    cJSON_AddNumberToObject(o, "seconds_up_this_time", (double)(time(NULL) - g_booted));
+    cJSON_AddStringToObject(o, "note",
+        "Counted in the same store as everything else, so these survive restarts. "
+        "This machine keeps no local state at all.");
+    if (!cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"result did not fit\"}");
+    cJSON_Delete(o);
+}
+
 static void call_tool(const char *name, const cJSON *args) {
     if      (strcmp(name, "machine_facts") == 0) tool_machine_facts();
     else if (strcmp(name, "memory_usage")  == 0) tool_memory_usage();
     else if (strcmp(name, "build_info")    == 0) tool_build_info();
     else if (strcmp(name, "ping_api")      == 0) tool_ping_api();
     else if (strcmp(name, "startup_timing") == 0) tool_startup_timing();
+    else if (strcmp(name, "usage_stats")    == 0) tool_usage_stats();
     else if (strcmp(name, "recall")        == 0) tool_recall();
     else if (strcmp(name, "list_reminders") == 0) tool_list_reminders();
     else if (strcmp(name, "remind_me") == 0) {
@@ -973,6 +1040,23 @@ static void call_tool(const char *name, const cJSON *args) {
 }
 
 // ---------------------------------------------------------------- llm
+
+// Plain text: replies are sent without a parse mode, because Markdown modes
+// reject unescaped punctuation and a 400 here would mean silence.
+#define HELP_TEXT \
+    "I am an AI agent running as a BareMetal unikernel — one program with no " \
+    "operating system beneath it, in 16 MiB of RAM. When you text me, the reply " \
+    "comes from a 2.9 MB machine image with no kernel, no shell and no disk.\n\n" \
+    "Things worth asking:\n" \
+    "• how much memory are you using right now?\n" \
+    "• what is inside your image?\n" \
+    "• how fast did you start up?\n" \
+    "• how many people have talked to you?\n\n" \
+    "I can also search the web, and set reminders — try \"remind me in 2 hours to " \
+    "call the plumber\". Tell me something about yourself and I will keep it: I " \
+    "have no disk, so my notes live on another machine and survive my restarts.\n\n" \
+    "Every number I give you about myself is measured when you ask, not " \
+    "remembered. Source: github.com/tabibazar/baremetal-agent"
 
 #define SYSTEM_PROMPT \
     "You are an AI agent running as a BareMetal unikernel: a single program with no " \
@@ -1228,7 +1312,10 @@ static void answer(long long chat_id, const char *question, const char *who, int
     printf("[+] to %s: %s\n", who, final);
     printf("    (arena peak this answer: %zu KB of %d KB)\n",
            g_arena_peak / 1024, ARENA_BYTES / 1024);
-    if (deliver && send_message(chat_id, final)) g_replies_window++;
+    if (deliver && send_message(chat_id, final)) {
+        g_replies_window++;
+        bump_usage(chat_id);
+    }
 }
 
 // Fetch new messages and answer them. Telegram delivers each update once the
@@ -1276,6 +1363,16 @@ static void poll_once(void) {
         printf("[*] %s: %s\n", who, question);
         g_current_chat = chat_id;
 
+        // /start is the first thing almost everyone sends, and /help the second.
+        // Answering them from here costs no inference, arrives instantly, and
+        // says the same thing every time -- none of which is true of letting the
+        // model improvise an introduction.
+        if (strncmp(question, "/start", 6) == 0 || strncmp(question, "/help", 5) == 0) {
+            send_message(chat_id, HELP_TEXT);
+            printf("[+] sent the introduction to %s\n", who);
+            continue;
+        }
+
         if (!budget_allows()) {
             send_message(chat_id,
                 "I have hit my hourly reply limit, which exists so a demo cannot run up "
@@ -1322,6 +1419,9 @@ int main(int argc, char **argv) {
     // --ask "..." answers one question locally, printing rather than sending.
     int once = (argc > 1 && strcmp(argv[1], "--once") == 0);
     const char *ask = (argc > 2 && strcmp(argv[1], "--ask") == 0) ? argv[2] : NULL;
+    // --help-text sends the introduction to the configured chat and exits, so
+    // it can be read as the reader will read it before anyone is shown it.
+    int preview = (argc > 1 && strcmp(argv[1], "--help-text") == 0);
 
     cJSON_Hooks hooks;
     hooks.malloc_fn = arena_alloc;
@@ -1354,6 +1454,18 @@ int main(int argc, char **argv) {
             arena_reset();
         }
     }
+    if (preview) {
+        const char *chat = getenv("TELEGRAM_CHAT_ID");
+        if (chat && *chat) {
+            send_message(strtoll(chat, NULL, 10), HELP_TEXT);
+            printf("[+] introduction sent to %s\n", chat);
+        } else {
+            printf("%s\n", HELP_TEXT);
+        }
+        curl_global_cleanup();
+        return 0;
+    }
+
     if (ask) {
         // A real chat id if one is configured, so a reminder set from the
         // terminal is actually deliverable; otherwise a scratch identity.
