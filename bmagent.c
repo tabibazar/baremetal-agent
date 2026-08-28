@@ -94,7 +94,11 @@
 #define MAX_STEPS       6           // tool-calling rounds per message
 #endif
 #ifndef REPLIES_PER_HOUR
-#define REPLIES_PER_HOUR 40         // spend ceiling; enforced here, not in the prompt
+#define REPLIES_PER_HOUR 300        // spend ceiling; enforced here, not in the prompt.
+                                    // 40 was sized for a private demo. A bot
+                                    // whose handle is public needs room to answer
+                                    // strangers without every one of them meeting
+                                    // the rate limiter instead of the agent.
 #endif
 #ifndef POLL_SECONDS
 #define POLL_SECONDS    3
