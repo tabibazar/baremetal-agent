@@ -104,6 +104,33 @@ which is how the two transport bugs below were found. Folding it into the agent
 took the footprint from 9,588 KB to 10.3 MiB — 64% of the machine — and freed
 the second instance.
 
+## bm4d — a four-dimensional cross-section, animated
+
+`bm4d.c` rotates a tesseract — the 4D hypercube — rigidly through 4-space and
+cuts it with the fixed hyperplane w = 0. The cut is a 3D polyhedron, and as the
+rotation turns the hypercube's square faces through the slice, that polyhedron
+morphs: cube, sheared prism, tilted box, back to a cube. Each frame is one
+moment of the morph, projected to 2D and drawn as a wireframe. It is the same
+idea as slicing a solid to read its 2D cross-sections, one dimension up.
+
+At rest the cross-section is a perfect cube, which is not a coincidence: a
+tesseract has twelve edges parallel to w, the slice cuts each once, and a cube
+has twelve edges.
+
+It reuses the whole renderer from `bmdemo` unchanged — the hand-written PNG,
+the deflate encoder, the per-frame adaptive sizing, the four-try sender. Only
+the engine differs: no per-pixel escape loop, just 16 vertices, 24 faces, and
+a line drawn where each face crosses the slice. That makes the frames line art
+on a flat field, which deflate compresses to about 4 KB at 320×320 — a quarter
+of what the link will carry, where the organic alternative (a gyroid
+cross-section) would have been dense texture and forced a much smaller frame.
+
+The render-twice check rides along and reports zero disagreements, as expected:
+the geometry is floating point and the rasteriser is integer add-and-compare,
+neither of which is the 128-bit division path where this platform's
+[arithmetic nondeterminism](https://github.com/tabibazar/unikernel-c/tree/main/docs/nanos-vs-baremetal)
+lives.
+
 ## bmdemo — the standalone renderer
 
 `bmdemo.c` renders the Mandelbrot set as a BareMetal unikernel and posts frames
