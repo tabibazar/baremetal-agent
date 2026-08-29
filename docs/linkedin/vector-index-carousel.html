@@ -1,0 +1,181 @@
+<meta charset="utf-8">
+<title>vector index carousel</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  @page { size: 1080px 1080px; margin: 0; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #0b0906; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .slide {
+    width: 1080px; height: 1080px; background: #0b0906; color: #ece5d6;
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    padding: 88px 84px 74px; position: relative;
+    page-break-after: always; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .slide:last-child { page-break-after: auto; }
+  .eyebrow { font-family: "IBM Plex Mono", monospace; font-size: 25px; letter-spacing: 0.16em;
+             text-transform: uppercase; color: #ffb000; margin-bottom: 34px; }
+  h1 { font-family: "IBM Plex Mono", monospace; font-size: 74px; line-height: 1.04;
+       letter-spacing: -0.03em; font-weight: 600; }
+  h2 { font-family: "IBM Plex Mono", monospace; font-size: 56px; line-height: 1.08;
+       letter-spacing: -0.025em; font-weight: 600; margin-bottom: 30px; }
+  p { font-size: 35px; line-height: 1.4; color: #d8cfbc; }
+  p + p { margin-top: 22px; }
+  .lede { font-size: 40px; color: #b3a68a; margin-top: 34px; }
+  .spacer { flex: 1; }
+  .hi { color: #ffb000; }
+  .kicker { font-family: "IBM Plex Mono", monospace; font-size: 29px; line-height: 1.42;
+            color: #ffb000; border-top: 2px solid #2e2718; padding-top: 26px; margin-top: 28px;
+            padding-right: 120px; }
+  .num { position: absolute; right: 84px; bottom: 60px; font-family: "IBM Plex Mono", monospace;
+         font-size: 24px; color: #6a6047; }
+  .huge { font-family: "IBM Plex Mono", monospace; font-size: 170px; font-weight: 600;
+          color: #ffb000; line-height: 1; letter-spacing: -0.05em; }
+  .code { font-family: "IBM Plex Mono", monospace; font-size: 27px; line-height: 1.62;
+          background: #050403; border-left: 6px solid #ffb000; padding: 26px 30px;
+          margin: 26px 0; color: #ffb000; white-space: pre; overflow: hidden; }
+  .budget { font-family: "IBM Plex Mono", monospace; font-size: 29px; line-height: 1.85;
+            color: #ece5d6; margin: 20px 0; white-space: pre; }
+  .budget .u { color: #8f7a4a; }
+  .budget .rule { color: #2e2718; }
+  .budget .tot { color: #ffb000; }
+  .ba { display: flex; align-items: baseline; gap: 28px; margin: 30px 0 6px; }
+  .ba .n { font-family: "IBM Plex Mono", monospace; font-size: 92px; font-weight: 600;
+           letter-spacing: -0.04em; line-height: 1; }
+  .ba .t { font-size: 30px; color: #b3a68a; line-height: 1.3; }
+  .was .n { color: #6a6047; }
+  .now .n { color: #ffb000; }
+</style>
+
+<!-- 1 -->
+<div class="slide">
+  <p class="eyebrow">A 16 MiB computer</p>
+  <h1>Our AI agent was using 4% of its machine.</h1>
+  <p class="lede">We gave it 59%. On purpose, and it made the thing genuinely better.</p>
+  <div class="spacer"></div>
+  <p class="kicker">A vector database with no database under it — and no operating system either.</p>
+  <p class="num">1 / 12</p>
+</div>
+
+<!-- 2 -->
+<div class="slide">
+  <p class="eyebrow">The machine in question</p>
+  <h2>One program. No OS beneath it.</h2>
+  <p>A Telegram agent compiled as a <span class="hi">BareMetal unikernel</span>: no kernel, no shell, no init, no container, no disk. A 2.9 MB image that boots straight into <span class="hi">main()</span>.</p>
+  <p>Its memory ceiling is not a plan you upgrade. It is the platform maximum:</p>
+  <div class="code">{ "error": "ramMib exceeds the maximum of 16" }</div>
+  <div class="spacer"></div>
+  <p class="num">2 / 12</p>
+</div>
+
+<!-- 3 -->
+<div class="slide">
+  <p class="eyebrow">The problem worth solving</p>
+  <h2>It could only find what you filed.</h2>
+  <p>The agent remembers things you tell it. But recall was exact-key lookup — ask "what do you know about boot times?" and it found nothing, because you had filed it as "the unikernel starts in 31 ms".</p>
+  <p>The notes were there. The words were wrong.</p>
+  <div class="spacer"></div>
+  <p class="num">3 / 12</p>
+</div>
+
+<!-- 4 -->
+<div class="slide">
+  <p class="eyebrow">What we built</p>
+  <h2>Every memory, embedded, resident in RAM.</h2>
+  <p>Each note is embedded once into a <span class="hi">768-dimension vector</span> and kept in a static array. A question is embedded too, then compared against every resident vector.</p>
+  <p>One pass over an array. <span class="hi">No tree. No index structure. No database. No disk</span> — this machine has none of those things and now needs none of them.</p>
+  <div class="spacer"></div>
+  <p class="num">4 / 12</p>
+</div>
+
+<!-- 5 -->
+<div class="slide">
+  <p class="eyebrow">The budget, against a hard 16</p>
+  <h2>9.37 MiB, claimed at link time.</h2>
+  <div class="budget">vectors   2560 × 768 × 4 B  <span class="u">= 7.50 MiB</span>
+text      2560 × 192 B      <span class="u">= 0.47 MiB</span>
+chat ids  2560 × 8 B        <span class="u">= 0.02 MiB</span>
+buffers   arena/HTTP/JSON   <span class="u">= 1.38 MiB</span>
+<span class="rule">──────────────────────────────────</span>
+<span class="tot">total                       = 9.37 MiB of 16</span></div>
+  <div class="spacer"></div>
+  <p class="kicker">2,560 memories, searchable by meaning, on a machine with 16 MiB and no OS.</p>
+  <p class="num">5 / 12</p>
+</div>
+
+<!-- 6 -->
+<div class="slide">
+  <p class="eyebrow">The part that surprised us</p>
+  <h2>8 MiB of RAM cost 31 KB of image.</h2>
+  <div class="ba was"><span class="n">2,880,384</span><span class="t">bytes uploaded<br>before</span></div>
+  <div class="ba now"><span class="n">2,911,872</span><span class="t">bytes uploaded<br>after</span></div>
+  <p style="margin-top:26px">Uninitialised statics aren't stored in the file. The whole 31 KB difference is code — the machine simply wakes up with the room already claimed.</p>
+  <div class="spacer"></div>
+  <p class="num">6 / 12</p>
+</div>
+
+<!-- 7 -->
+<div class="slide">
+  <p class="eyebrow">Gotcha #1 — the silent one</p>
+  <h2>Truncated embeddings are not unit vectors.</h2>
+  <p>The model returns 3072 dimensions and truncates to 768 on request. We assumed the result was still unit length.</p>
+  <p>It isn't. Measured norm: <span class="hi">0.59</span>.</p>
+  <div class="spacer"></div>
+  <p class="kicker">Cosine over unnormalised vectors ranks LONGER notes above CLOSER ones. Silently. Plausibly. You would never catch it from the output.</p>
+  <p class="num">7 / 12</p>
+</div>
+
+<!-- 8 -->
+<div class="slide">
+  <p class="eyebrow">Gotcha #2 — the boring one that matters</p>
+  <h2>We parse 3,072 floats by hand.</h2>
+  <p>There is no heap in this program. JSON goes through a fixed bump arena, and a batch of four embeddings would become <span class="hi">3,072 separate nodes</span> in it.</p>
+  <p>So the embeddings are scanned out of the response with <span class="hi">strtod</span>. It costs nothing, and the shape is safe to assume — this program wrote the request.</p>
+  <div class="spacer"></div>
+  <p class="num">8 / 12</p>
+</div>
+
+<!-- 9 -->
+<div class="slide">
+  <p class="eyebrow">The decision we are proudest of</p>
+  <p class="huge">1 in 4000</p>
+  <h2 style="margin-top:26px">results on this platform come back wrong.</h2>
+  <p>We had measured it that morning: this unikernel corrupts 64-bit arithmetic under load. A brute-force dot product over a big array is <em>exactly</em> that loop shape.</p>
+  <div class="spacer"></div>
+  <p class="num">9 / 12</p>
+</div>
+
+<!-- 10 -->
+<div class="slide">
+  <p class="eyebrow">So we built it anyway</p>
+  <h2>Because of how it fails, not whether.</h2>
+  <p>A corrupted score reorders two neighbours in a ranked list. It cannot crash. It cannot invent a memory that was never stored.</p>
+  <p>A feature needing exact arithmetic would have been the wrong thing to put on this machine. <span class="hi">The constraint picked the feature</span> — not the other way round.</p>
+  <div class="spacer"></div>
+  <p class="kicker">Know your platform's failure mode, then choose work that degrades instead of breaking.</p>
+  <p class="num">10 / 12</p>
+</div>
+
+<!-- 11 -->
+<div class="slide">
+  <p class="eyebrow">Measure first, then claim</p>
+  <h2>13 MiB boots. 14 does not.</h2>
+  <p>Before writing a line of the feature, we probed the real ceiling: allocate X MiB, write every page, read it all back, see whether the machine survives.</p>
+  <p>Then sized the index to fit with margin, rather than guessing and finding out in production.</p>
+  <div class="spacer"></div>
+  <p class="kicker">5 of 5 test queries return the note a human would pick. Search time over the index: 4.2 microseconds.</p>
+  <p class="num">11 / 12</p>
+</div>
+
+<!-- 12 -->
+<div class="slide">
+  <p class="eyebrow">It is live right now</p>
+  <h2>Ask it something. It will remember.</h2>
+  <div class="code">[+] agent up. ram=16 MiB static=9588 KB (59% of RAM)
+[+] semantic index: 2560 slots × 768 dims
+    = 8180 KB resident, searched in RAM</div>
+  <p>Open source, C, no heap, no OS.</p>
+  <div class="code">github.com/tabibazar/baremetal-agent</div>
+  <div class="spacer"></div>
+  <p class="kicker">Built on Return Infinity's BareMetal. The arithmetic bug is reported, with a 60-line reproducer.</p>
+  <p class="num">12 / 12</p>
+</div>
