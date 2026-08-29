@@ -79,6 +79,53 @@ The first four report on the machine the agent is living inside, which is the po
 people who just want to talk to it — every feature, every limit, and real
 transcripts rather than invented ones.
 
+## bmdemo — a fractal renderer with no graphics library
+
+`bmdemo.c` renders the Mandelbrot set as a BareMetal unikernel and posts frames
+to Telegram. No GPU, no graphics library, no image library, no operating
+system: arithmetic and a socket. The PNG is encoded by hand, because linking
+libpng would have meant porting zlib, and a store-only deflate stream is legal
+PNG that every decoder accepts.
+
+It renders each frame **twice**. An escape count is a pure function of the
+pixel, so a correct machine returns the same image both times by construction —
+and [this one does not agree with itself](https://github.com/tabibazar/unikernel-c/tree/main/docs/nanos-vs-baremetal)
+about one result in four thousand. Pixels where the two passes differ are
+painted red and counted in the caption.
+
+So far every frame has come back clean, which is itself a result: the measured
+corruption is in 64-bit integer modular arithmetic, which gcc lowers to a
+`__udivti3` call, and a Mandelbrot loop is double-precision floating point in
+SSE registers. Different path, and so far an uncorrupted one.
+
+### The 256 KiB wall
+
+The first frames would not send. 787 KB failed with `CURLE_RECV_ERROR`, and
+263 KB with `CURLE_SEND_ERROR` — while the identical binary posted the identical
+body from Linux on the same host without complaint. So the limit was this
+port's, not the API's.
+
+`bmprobe.c` finds it in one deploy instead of one guess per redeploy: a ladder
+of body sizes posted over real HTTPS, one line of output per rung.
+
+```
+PROBE 196608 bytes  ok      HTTP 401 (1s)
+PROBE 262144 bytes  ok      HTTP 401 (2s)
+[+] largest body that left this machine: 256 KB
+```
+
+Everything up to **262,144 bytes** leaves the machine. The 512×512 frame was
+263,824 bytes with its multipart wrapper — over by 1,680 bytes, or 0.6%. The
+conclusion drawn before measuring, that this needed a real deflate encoder, was
+wrong by that margin; the frame is 480×480 now and fits with 30 KB to spare.
+
+The response times stay flat at 1–2 seconds all the way up the ladder, with no
+degradation approaching the limit. That is the shape of a fixed buffer rather
+than congestion or a window problem, which is the more useful thing to report.
+
+A 401 is a pass here: the probe posts junk to our own key-value service, so any
+HTTP status at all means the body crossed the wire and a response came back.
+
 ### A vector database with no database under it
 
 A cloud instance is capped at **16 MiB** — that is the platform maximum, not a
