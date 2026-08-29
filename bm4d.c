@@ -599,14 +599,19 @@ static int send_photo_once(const uint8_t *png, size_t png_len, const char *capti
 static long g_sends, g_retries, g_failures;
 
 static int send_photo(const uint8_t *png, size_t png_len, const char *caption) {
-    for (int attempt = 1; attempt <= 4; attempt++) {
+    // Eight attempts, not four. The frames are tiny and 90s apart, so retrying
+    // is nearly free, and the transport fails often enough that four was not
+    // always sufficient -- a 5.7 KB frame missed all four on the first run.
+    // This is a client mitigation for a platform-level intermittency, not a
+    // fix: the same body posts first time, every time, from Linux.
+    for (int attempt = 1; attempt <= 8; attempt++) {
         g_sends++;
         if (send_photo_once(png, png_len, caption)) {
             if (attempt > 1) printf("[+] delivered on attempt %d\n", attempt);
             return 1;
         }
         g_retries++;
-        sleep(attempt * 3);          // 3s, 6s, 9s -- brief, widening
+        sleep(attempt < 4 ? attempt * 2 : 8);   // 2,4,6,8,8,8,8 -- widen then hold
     }
     g_failures++;
     return 0;
@@ -687,54 +692,24 @@ int main(int argc, char **argv) {
            (sizeof(g_scratch) + sizeof(g_pass1) + sizeof(g_idx) + sizeof(g_body)
             + 320 * 1024) / 1024);
 
-    // Find the largest frame this machine can actually post, by posting.
+    // No size probe. The fractal needed one because its frames could genuinely
+    // exceed the link's budget; a wireframe cannot. Every frame of this
+    // animation, at full 480x480 and across a full rotation, encodes to under
+    // 6.5 KB -- comfortably inside the ~14 KB the link carries at its worst.
     //
-    // A ladder of body sizes against Telegram said everything from 16 KB up
-    // failed -- but that probe sent deliberately invalid JSON, so the server
-    // may have been rejecting it early and closing the connection mid-upload,
-    // which looks identical from this end. The only way to separate "the port
-    // cannot send this much" from "the server hung up on nonsense" is to send
-    // something valid. A real frame is something valid.
+    // Worse, probing by posting is actively harmful here. The transport fails
+    // intermittently regardless of size -- a 2 KB frame failed four attempts in
+    // a row on the first run -- so a probe ladder that stops at the first
+    // failing rung caps the whole animation at whatever size happened to draw
+    // an unlucky streak. It settled at 128x128 once for exactly that reason.
     //
-    // So: render small, post it, and step up while it keeps working. The
-    // largest size that survives becomes the size it runs at. The machine
-    // discovers its own limit instead of being told one.
-    int chosen = 0;
+    // So: render at full size, and lean on the four-try sender for the
+    // flakiness. The per-frame safety drop below stays, but on this workload it
+    // never fires.
+    g_w = g_h = W;
+    g_budget = 14000;
+    printf("[+] rendering at %dx%d, no size probe (wireframe fits with room)\n", g_w, g_h);
 
-    for (int i = 0; i < N_LADDER; i++) {
-        g_w = g_h = LADDER[i];
-        slice_render(0.0);
-        static uint8_t probe_png[320 * 1024];
-        size_t n = png_encode(probe_png, sizeof(probe_png));
-        if (!n) { printf("[!] %dx%d did not fit the buffer\n", g_w, g_w); break; }
-
-        char cap[256];
-        snprintf(cap, sizeof(cap),
-                 "sizing up: %dx%d, %zu bytes. Finding the largest frame this "
-                 "machine can post.", g_w, g_h, n);
-        int ok = send_photo(probe_png, n, cap);
-        printf("[+] ladder %3dx%-3d png=%6zu bytes  %s\n", g_w, g_h, n,
-               ok ? "posted" : "FAILED after 4 attempts");
-        if (!ok) break;
-        chosen = LADDER[i];
-        g_budget = n;           // this many bytes is known to work
-        sleep(3);
-    }
-
-    if (!chosen) {
-        fprintf(stderr, "[!] could not post even the smallest frame\n");
-        return 1;
-    }
-    g_w = g_h = chosen;
-    printf("[+] settled on %dx%d\n", chosen, chosen);
-
-    // Track the field of view -- how much of the plane is on screen -- rather
-    // than the distance between pixels. They differ the moment the frame size
-    // changes: holding units-per-pixel fixed while dropping 320 to 256 keeps
-    // the detail and quietly crops a fifth of the picture away, so the
-    // sequence jumps instead of zooming. Holding the field of view fixed
-    // shows the same region at fewer pixels, which is what dropping
-    // resolution should mean.
     double angle = 0.0;
     long frame = 0;
 
