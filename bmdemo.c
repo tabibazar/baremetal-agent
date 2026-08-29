@@ -59,8 +59,9 @@
 //
 // The limit is the port's, not the API's: the same binary posts a 787 KB frame
 // from Linux on the same host without complaint.
-#define W            480
+#define W            480        // maximum; the working size is found at runtime
 #define H            480
+static int g_w = 480, g_h = 480;
 #define MAX_ITER     600
 #define FRAMES       0          // 0 = keep going until stopped
 #define FRAME_GAP    120        // seconds between frames. Rendering is on top
@@ -148,11 +149,11 @@ static uint16_t escape(double cr, double ci) {
 }
 
 static void render(uint16_t *out, double scale) {
-    for (int y = 0; y < H; y++) {
-        double ci = TARGET_IM + ((double)y - H / 2.0) * scale;
-        for (int x = 0; x < W; x++) {
-            double cr = TARGET_RE + ((double)x - W / 2.0) * scale;
-            out[y * W + x] = escape(cr, ci);
+    for (int y = 0; y < g_h; y++) {
+        double ci = TARGET_IM + ((double)y - g_h / 2.0) * scale;
+        for (int x = 0; x < g_w; x++) {
+            double cr = TARGET_RE + ((double)x - g_w / 2.0) * scale;
+            out[y * g_w + x] = escape(cr, ci);
         }
     }
 }
@@ -178,7 +179,7 @@ static void build_palette(void) {
 }
 
 static void colourise(const uint16_t *it) {
-    for (int i = 0; i < W * H; i++) {
+    for (int i = 0; i < g_w * g_h; i++) {
         uint16_t n = it[i];
         if (n >= MAX_ITER) { g_idx[i] = PAL_INSIDE; continue; }
         // sqrt rather than a linear ramp, and cycling rather than a single
@@ -197,7 +198,7 @@ static void colourise(const uint16_t *it) {
 // Paint every pixel where the two passes disagreed. Returns how many.
 static long mark_disagreements(void) {
     long bad = 0;
-    for (int i = 0; i < W * H; i++) {
+    for (int i = 0; i < g_w * g_h; i++) {
         if (g_pass1[i] != g_pass2[i]) { g_idx[i] = PAL_BAD; bad++; }
     }
     return bad;
@@ -250,7 +251,7 @@ static void chunk(uint8_t *base, size_t *o, const char *type,
 // Encode g_idx + g_plte into buf, returning the byte count (0 if it would not fit).
 static size_t png_encode(uint8_t *buf, size_t cap) {
     // One index byte per pixel, plus PNG's per-scanline filter byte.
-    const size_t raw_len = (size_t)H * (1 + (size_t)W);
+    const size_t raw_len = (size_t)g_h * (1 + (size_t)g_w);
     // signature + IHDR + PLTE + IDAT + IEND + zlib overhead + a 5-byte
     // header per stored block
     const size_t need = 8 + 25 + (12 + 768) + 12 + 12 + raw_len + 6
@@ -262,7 +263,7 @@ static size_t png_encode(uint8_t *buf, size_t cap) {
     memcpy(buf, sig, 8); o = 8;
 
     uint8_t ihdr[13];
-    put32(ihdr, W); put32(ihdr + 4, H);
+    put32(ihdr, (uint32_t)g_w); put32(ihdr + 4, (uint32_t)g_h);
     ihdr[8] = 8;    // bit depth
     ihdr[9] = 3;    // colour type: palette
     ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
@@ -294,10 +295,10 @@ static size_t png_encode(uint8_t *buf, size_t cap) {
             // Filter byte 0 at the start of every scanline, then the pixels.
             uint8_t v;
             if (col == 0) { v = 0; }
-            else          { v = g_idx[(size_t)row * W + (col - 1)]; }
+            else          { v = g_idx[(size_t)row * g_w + (col - 1)]; }
             buf[o++] = v;
             a = (a + v) % 65521; b = (b + a) % 65521;
-            if (++col == 1 + W) { col = 0; row++; }
+            if (++col == 1 + g_w) { col = 0; row++; }
         }
         written += block;
     }
@@ -334,6 +335,28 @@ static size_t build_multipart(const char *boundary, const char *caption,
     return o;
 }
 
+// Feed the body to curl a chunk at a time instead of handing it a pointer.
+//
+// CURLOPT_POSTFIELDS with CURLOPT_POSTFIELDSIZE is supposed to send exactly
+// that many bytes whatever they contain. On Linux it does. In this port a
+// frame never arrived at any size -- while an ASCII body of the same length
+// went through fine -- and a PNG has its first NUL nine bytes in, at the end
+// of the signature. A body truncated at that NUL, with Content-Length still
+// promising the rest, leaves the server waiting for data that never comes and
+// eventually closing: which is the error we saw, at every size we tried.
+//
+// A read callback sidesteps the question entirely. It is also what curl's own
+// documentation recommends for anything that is not a C string.
+struct upload { const uint8_t *p; size_t left; };
+
+static size_t read_cb(char *dst, size_t sz, size_t nm, void *userp) {
+    struct upload *u = (struct upload *)userp;
+    size_t want = sz * nm;
+    if (want > u->left) want = u->left;
+    if (want) { memcpy(dst, u->p, want); u->p += want; u->left -= want; }
+    return want;
+}
+
 static int send_photo(const uint8_t *png, size_t png_len, const char *caption) {
     static const char *boundary = "----bmdemo7f3a91c2";
     g_body_len = build_multipart(boundary, caption, png, png_len);
@@ -351,9 +374,11 @@ static int send_photo(const uint8_t *png, size_t png_len, const char *caption) {
 
     g_sink.len = 0; g_resp[0] = '\0';
     curl_easy_setopt(h, CURLOPT_URL, url);
+    struct upload up = { g_body, g_body_len };
     curl_easy_setopt(h, CURLOPT_POST, 1L);
-    curl_easy_setopt(h, CURLOPT_POSTFIELDS, g_body);
-    curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)g_body_len);
+    curl_easy_setopt(h, CURLOPT_READFUNCTION, read_cb);
+    curl_easy_setopt(h, CURLOPT_READDATA, &up);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)g_body_len);
     curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(h, CURLOPT_TIMEOUT, HTTP_TIMEOUT);
@@ -395,8 +420,8 @@ int main(int argc, char **argv) {
     g_token = env_or("TELEGRAM_BOT_TOKEN", TELEGRAM_TOKEN_DEFAULT);
     g_chat  = env_or("DEMO_CHAT_ID",       DEMO_CHAT_DEFAULT);
 
-    int dry = (argc > 1 && strcmp(argv[1], "--dry") == 0);
-    if (!dry && !strchr(g_token, ':')) {
+    (void)argc; (void)argv;
+    if (!strchr(g_token, ':')) {
         fprintf(stderr, "[!] no usable Telegram token.\n");
         return 1;
     }
@@ -405,7 +430,51 @@ int main(int argc, char **argv) {
            (sizeof(g_pass1) + sizeof(g_pass2) + sizeof(g_idx) + sizeof(g_body)
             + 320 * 1024) / 1024);
 
-    double scale = 3.0 / W;          // start with the whole set in view
+    // Find the largest frame this machine can actually post, by posting.
+    //
+    // A ladder of body sizes against Telegram said everything from 16 KB up
+    // failed -- but that probe sent deliberately invalid JSON, so the server
+    // may have been rejecting it early and closing the connection mid-upload,
+    // which looks identical from this end. The only way to separate "the port
+    // cannot send this much" from "the server hung up on nonsense" is to send
+    // something valid. A real frame is something valid.
+    //
+    // So: render small, post it, and step up while it keeps working. The
+    // largest size that survives becomes the size it runs at. The machine
+    // discovers its own limit instead of being told one.
+    static const int LADDER[] = { 64, 96, 128, 160, 192, 256, 320, 384, 480 };
+    const int N_LADDER = (int)(sizeof(LADDER) / sizeof(LADDER[0]));
+    int chosen = 0;
+
+    for (int i = 0; i < N_LADDER; i++) {
+        g_w = g_h = LADDER[i];
+        double s0 = 3.0 / (double)g_w;
+        render(g_pass1, s0);
+        colourise(g_pass1);
+        static uint8_t probe_png[320 * 1024];
+        size_t n = png_encode(probe_png, sizeof(probe_png));
+        if (!n) { printf("[!] %dx%d did not fit the buffer\n", g_w, g_w); break; }
+
+        char cap[256];
+        snprintf(cap, sizeof(cap),
+                 "sizing up: %dx%d, %zu bytes. Finding the largest frame this "
+                 "machine can post.", g_w, g_h, n);
+        int ok = send_photo(probe_png, n, cap);
+        printf("[+] ladder %3dx%-3d png=%6zu bytes  %s\n", g_w, g_h, n,
+               ok ? "posted" : "FAILED");
+        if (!ok) break;
+        chosen = LADDER[i];
+        sleep(3);
+    }
+
+    if (!chosen) {
+        fprintf(stderr, "[!] could not post even the smallest frame\n");
+        return 1;
+    }
+    g_w = g_h = chosen;
+    printf("[+] settled on %dx%d\n", chosen, chosen);
+
+    double scale = 3.0 / (double)g_w;
     long frame = 0;
 
     for (;;) {
@@ -418,41 +487,31 @@ int main(int argc, char **argv) {
         colourise(g_pass1);
         long bad = mark_disagreements();
 
-        // The stream is stored, not compressed, so the file is a little
-        // larger than the raw pixels: H * (1 + W) plus chunk overhead.
         static uint8_t png[320 * 1024];
         size_t png_len = png_encode(png, sizeof(png));
         if (!png_len) { fprintf(stderr, "[!] png did not fit\n"); return 1; }
 
-        // Zoom as a plain multiple of the original width, which is the number
-        // a person can actually picture.
-        double zoom = (3.0 / W) / scale;
+        double zoom = (3.0 / (double)g_w) / scale;
         char caption[512];
         snprintf(caption, sizeof(caption),
-            "frame %ld  ·  zoom %.0fx  ·  %d iterations  ·  rendered twice in %lds\n"
+            "frame %ld  \xc2\xb7  zoom %.0fx  \xc2\xb7  %d iterations  \xc2\xb7  rendered twice in %lds\n"
             "%ld pixels disagreed between the two passes%s\n"
-            "512x512 PNG encoded by hand, in a 16 MiB machine with no operating system.",
+            "%dx%d PNG encoded by hand, in a 16 MiB machine with no operating system.",
             frame, zoom, MAX_ITER, secs, bad,
-            bad ? " — each red dot is this machine giving two different answers to the same arithmetic."
-                : " — clean frame.");
+            bad ? " \xe2\x80\x94 each red dot is this machine giving two different answers to the same arithmetic."
+                : " \xe2\x80\x94 clean frame.",
+            g_w, g_h);
 
         printf("[+] frame %ld zoom=%.0fx render=%lds disagreements=%ld png=%zu bytes\n",
                frame, zoom, secs, bad, png_len);
 
-        if (dry) {
-            FILE *f = fopen("frame.png", "wb");
-            if (f) { fwrite(png, 1, png_len, f); fclose(f); printf("[+] wrote frame.png\n"); }
-            if (frame >= 2) break;
-        } else if (!send_photo(png, png_len, caption)) {
+        if (!send_photo(png, png_len, caption))
             fprintf(stderr, "[!] frame %ld not delivered\n", frame);
-        }
 
         if (FRAMES && frame >= FRAMES) break;
         scale /= ZOOM_PER_FRAME;
-        // Doubles run out of precision near 1e-15 per pixel; start over rather
-        // than post the grey mush that follows.
-        if (scale < 1e-15) { scale = 3.0 / W; printf("[+] precision floor, restarting the zoom\n"); }
-        if (!dry) sleep(FRAME_GAP);
+        if (scale < 1e-15) { scale = 3.0 / (double)g_w; printf("[+] precision floor, restarting the zoom\n"); }
+        sleep(FRAME_GAP);
     }
     curl_global_cleanup();
     return 0;
