@@ -270,6 +270,11 @@ static void chunk(uint8_t *base, size_t *o, const char *type,
 // to get wrong. Dynamic would beat it by perhaps a fifth, which is not worth
 // the extra hundred lines here.
 
+// Sizes the renderer will try, smallest first.
+static const int LADDER[] = { 64, 96, 128, 160, 192, 256, 320, 384, 480 };
+#define N_LADDER ((int)(sizeof(LADDER) / sizeof(LADDER[0])))
+static size_t g_budget;     // largest frame this machine has actually delivered
+
 #define DEF_WINDOW  32768
 #define DEF_MIN_MATCH 3
 #define DEF_MAX_MATCH 258
@@ -625,8 +630,6 @@ int main(int argc, char **argv) {
     // So: render small, post it, and step up while it keeps working. The
     // largest size that survives becomes the size it runs at. The machine
     // discovers its own limit instead of being told one.
-    static const int LADDER[] = { 64, 96, 128, 160, 192, 256, 320, 384, 480 };
-    const int N_LADDER = (int)(sizeof(LADDER) / sizeof(LADDER[0]));
     int chosen = 0;
 
     for (int i = 0; i < N_LADDER; i++) {
@@ -647,6 +650,7 @@ int main(int argc, char **argv) {
                ok ? "posted" : "FAILED after 4 attempts");
         if (!ok) break;
         chosen = LADDER[i];
+        g_budget = n;           // this many bytes is known to work
         sleep(3);
     }
 
@@ -663,16 +667,35 @@ int main(int argc, char **argv) {
     for (;;) {
         frame++;
         time_t t0 = time(NULL);
-        render(g_pass1, scale);
-        render(g_pass2, scale);      // the same work, again, on purpose
-        long secs = (long)(time(NULL) - t0);
-
-        colourise(g_pass1);
-        long bad = mark_disagreements();
-
+        long bad = 0, secs = 0;
         static uint8_t png[320 * 1024];
-        size_t png_len = png_encode(png, sizeof(png));
-        if (!png_len) { fprintf(stderr, "[!] png did not fit\n"); return 1; }
+        size_t png_len = 0;
+
+        // Re-check the size every frame, not once at boot.
+        //
+        // Deeper zooms are more detailed, so they compress worse: frame 1 at
+        // 320x320 came to 14,240 bytes and went through, and frame 2 at the
+        // same dimensions came to 17,065 and did not. A size chosen once from
+        // the simplest frame in the sequence is a size that stops working
+        // three frames later.
+        for (;;) {
+            t0 = time(NULL);
+            render(g_pass1, scale);
+            render(g_pass2, scale);  // the same work, again, on purpose
+            secs = (long)(time(NULL) - t0);
+            colourise(g_pass1);
+            bad = mark_disagreements();
+            png_len = png_encode(png, sizeof(png));
+            if (!png_len) { fprintf(stderr, "[!] png did not fit\n"); return 1; }
+            if (!g_budget || png_len <= g_budget) break;
+
+            int idx = 0;
+            while (idx < N_LADDER - 1 && LADDER[idx] < g_w) idx++;
+            if (idx == 0) break;             // already at the smallest; send it and hope
+            g_w = g_h = LADDER[idx - 1];
+            printf("[+] frame %ld was %zu bytes, over the %zu that works -- dropping to %dx%d\n",
+                   frame, png_len, g_budget, g_w, g_h);
+        }
 
         double zoom = (3.0 / (double)g_w) / scale;
         // %.0f rounded the first several frames to "1x" and made a zoom
