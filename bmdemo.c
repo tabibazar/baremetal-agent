@@ -248,68 +248,223 @@ static void chunk(uint8_t *base, size_t *o, const char *type,
     put32(base + *o, c); *o += 4;
 }
 
-// Encode g_idx + g_plte into buf, returning the byte count (0 if it would not fit).
-static size_t png_encode(uint8_t *buf, size_t cap) {
-    // One index byte per pixel, plus PNG's per-scanline filter byte.
-    const size_t raw_len = (size_t)g_h * (1 + (size_t)g_w);
-    // signature + IHDR + PLTE + IDAT + IEND + zlib overhead + a 5-byte
-    // header per stored block
-    const size_t need = 8 + 25 + (12 + 768) + 12 + 12 + raw_len + 6
-                      + (raw_len / 65535 + 1) * 5;
-    if (need > cap) return 0;
 
+// ---------------------------------------------------------------- deflate
+//
+// Fixed-Huffman deflate with LZ77 matching, written here because there is no
+// zlib to link and the alternative was staying at 96x96.
+//
+// Stored blocks got the first version working, but they are not compression:
+// the file is the pixels plus five bytes per 64 KB. A real ceiling of about
+// 16 KB per HTTPS request to this endpoint therefore capped the picture at
+// 96x96, which is small enough to be disappointing.
+//
+// A Mandelbrot compresses extraordinarily well and it is worth seeing why: the
+// interior is one flat colour, the escape bands are long runs of one palette
+// index, and consecutive scanlines are nearly identical -- so a match at
+// distance (width + 1) reproduces most of a row from the row above it. LZ77
+// finds all three without being told about any of them.
+//
+// Fixed Huffman rather than dynamic: the code lengths are defined by the
+// standard, so there is no tree to build, no tree to serialise, and far less
+// to get wrong. Dynamic would beat it by perhaps a fifth, which is not worth
+// the extra hundred lines here.
+
+#define DEF_WINDOW  32768
+#define DEF_MIN_MATCH 3
+#define DEF_MAX_MATCH 258
+#define DEF_HASH_BITS 15
+#define DEF_HASH_SIZE (1 << DEF_HASH_BITS)
+
+static uint8_t  *g_ob;          // output cursor state for the bit writer
+static size_t    g_ocap, g_olen;
+static uint32_t  g_bitbuf;
+static int       g_bitcnt;
+static int       g_overflow;
+static int32_t   g_head[DEF_HASH_SIZE];
+static int32_t   g_prev[DEF_WINDOW];
+
+static void bw_init(uint8_t *out, size_t cap) {
+    g_ob = out; g_ocap = cap; g_olen = 0;
+    g_bitbuf = 0; g_bitcnt = 0; g_overflow = 0;
+}
+
+// Deflate writes bits least-significant first within each byte.
+static void put_bits(uint32_t v, int n) {
+    g_bitbuf |= (v & ((1u << n) - 1u)) << g_bitcnt;
+    g_bitcnt += n;
+    while (g_bitcnt >= 8) {
+        if (g_olen < g_ocap) g_ob[g_olen++] = (uint8_t)(g_bitbuf & 0xFF);
+        else g_overflow = 1;
+        g_bitbuf >>= 8;
+        g_bitcnt -= 8;
+    }
+}
+
+// Huffman codes are defined most-significant bit first, which is the opposite
+// order to everything else in the format. Emitting them a bit at a time from
+// the top is slower than a reversal table and much harder to get wrong.
+static void put_code(uint32_t code, int len) {
+    for (int i = len - 1; i >= 0; i--) put_bits((code >> i) & 1u, 1);
+}
+
+static void bw_flush(void) {
+    if (g_bitcnt > 0) {
+        if (g_olen < g_ocap) g_ob[g_olen++] = (uint8_t)(g_bitbuf & 0xFF);
+        else g_overflow = 1;
+        g_bitbuf = 0; g_bitcnt = 0;
+    }
+}
+
+// The fixed literal/length code, straight from RFC 1951 section 3.2.6.
+static void put_literal(int sym) {
+    if (sym <= 143)      put_code(0x30u  + (uint32_t)sym, 8);
+    else if (sym <= 255) put_code(0x190u + (uint32_t)(sym - 144), 9);
+    else if (sym <= 279) put_code(0x0u   + (uint32_t)(sym - 256), 7);
+    else                 put_code(0xC0u  + (uint32_t)(sym - 280), 8);
+}
+
+static const uint16_t LEN_BASE[29] = {
+    3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
+static const uint8_t LEN_EXTRA[29] = {
+    0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
+static const uint16_t DIST_BASE[30] = {
+    1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+    1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
+static const uint8_t DIST_EXTRA[30] = {
+    0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
+
+static void put_match(int len, int dist) {
+    int lc = 28;
+    while (lc > 0 && len < LEN_BASE[lc]) lc--;
+    put_literal(257 + lc);
+    if (LEN_EXTRA[lc]) put_bits((uint32_t)(len - LEN_BASE[lc]), LEN_EXTRA[lc]);
+
+    int dc = 29;
+    while (dc > 0 && dist < DIST_BASE[dc]) dc--;
+    put_code((uint32_t)dc, 5);                      // distance codes are 5 bits fixed
+    if (DIST_EXTRA[dc]) put_bits((uint32_t)(dist - DIST_BASE[dc]), DIST_EXTRA[dc]);
+}
+
+static uint32_t dhash(const uint8_t *p) {
+    return (uint32_t)(((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (DEF_HASH_SIZE - 1));
+}
+
+// Compress src into a zlib stream at out. Returns bytes written, 0 on overflow.
+static size_t zlib_deflate(const uint8_t *src, size_t len, uint8_t *out, size_t cap) {
+    bw_init(out, cap);
+    if (cap < 8) return 0;
+    g_ob[g_olen++] = 0x78;                          // CMF: deflate, 32K window
+    g_ob[g_olen++] = 0x01;                          // FLG: (0x7801 % 31) == 0
+    put_bits(1, 1);                                 // BFINAL
+    put_bits(1, 2);                                 // BTYPE: fixed Huffman
+
+    for (int i = 0; i < DEF_HASH_SIZE; i++) g_head[i] = -1;
+
+    size_t pos = 0;
+    while (pos < len) {
+        int best_len = 0, best_dist = 0;
+        if (pos + DEF_MIN_MATCH <= len) {
+            uint32_t h = dhash(src + pos);
+            int32_t cand = g_head[h];
+            // One chain, bounded: the data is mostly long runs, so the first
+            // few candidates are as good as the hundredth and the search is
+            // where all the time would go.
+            int tries = 16;
+            while (cand >= 0 && tries-- > 0) {
+                size_t dist = pos - (size_t)cand;
+                if (dist == 0 || dist > DEF_WINDOW) break;
+                size_t maxl = len - pos;
+                if (maxl > DEF_MAX_MATCH) maxl = DEF_MAX_MATCH;
+                size_t l = 0;
+                while (l < maxl && src[cand + l] == src[pos + l]) l++;
+                if ((int)l > best_len) { best_len = (int)l; best_dist = (int)dist; }
+                if (best_len >= (int)maxl) break;
+                cand = g_prev[(size_t)cand & (DEF_WINDOW - 1)];
+            }
+        }
+
+        if (best_len >= DEF_MIN_MATCH) {
+            put_match(best_len, best_dist);
+            for (int k = 0; k < best_len; k++) {
+                if (pos + DEF_MIN_MATCH <= len) {
+                    uint32_t h = dhash(src + pos);
+                    g_prev[pos & (DEF_WINDOW - 1)] = g_head[h];
+                    g_head[h] = (int32_t)pos;
+                }
+                pos++;
+            }
+        } else {
+            put_literal(src[pos]);
+            if (pos + DEF_MIN_MATCH <= len) {
+                uint32_t h = dhash(src + pos);
+                g_prev[pos & (DEF_WINDOW - 1)] = g_head[h];
+                g_head[h] = (int32_t)pos;
+            }
+            pos++;
+        }
+        if (g_overflow) return 0;
+    }
+
+    put_literal(256);                               // end of block
+    bw_flush();
+
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; i++) { a = (a + src[i]) % 65521; b = (b + a) % 65521; }
+    if (g_olen + 4 > g_ocap) return 0;
+    put32(g_ob + g_olen, (b << 16) | a); g_olen += 4;
+    return g_overflow ? 0 : g_olen;
+}
+
+// Encode g_idx + g_plte into buf, returning the byte count (0 if it would not fit).
+static uint8_t g_raw[(W + 1) * H];      // filter byte + indices, per scanline
+
+static size_t png_encode(uint8_t *buf, size_t cap) {
+    const size_t raw_len = (size_t)g_h * (1 + (size_t)g_w);
+    if (raw_len > sizeof(g_raw)) return 0;
+    if (cap < 8 + 25 + (12 + 768) + 12 + 12) return 0;
+
+    // Filter type 0 (None) on every scanline. Filtering exists to make bytes
+    // more compressible, but a palette index is a label rather than a
+    // magnitude -- subtracting one index from another produces noise, not a
+    // small number. Leaving the rows alone lets the matcher find them whole:
+    // a scanline that repeats the one above it becomes a single match at
+    // distance width+1.
     size_t o = 0;
+    for (int y = 0; y < g_h; y++) {
+        g_raw[o++] = 0;
+        memcpy(g_raw + o, g_idx + (size_t)y * g_w, (size_t)g_w);
+        o += (size_t)g_w;
+    }
+
+    size_t p = 0;
     static const uint8_t sig[8] = { 137, 'P', 'N', 'G', '\r', '\n', 26, '\n' };
-    memcpy(buf, sig, 8); o = 8;
+    memcpy(buf, sig, 8); p = 8;
 
     uint8_t ihdr[13];
     put32(ihdr, (uint32_t)g_w); put32(ihdr + 4, (uint32_t)g_h);
     ihdr[8] = 8;    // bit depth
     ihdr[9] = 3;    // colour type: palette
     ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
-    chunk(buf, &o, "IHDR", ihdr, sizeof(ihdr));
-    chunk(buf, &o, "PLTE", g_plte, sizeof(g_plte));
+    chunk(buf, &p, "IHDR", ihdr, sizeof(ihdr));
+    chunk(buf, &p, "PLTE", g_plte, sizeof(g_plte));
 
-    // The IDAT payload is written in place, so its length is known only after
-    // the fact: remember where it starts and patch the header afterwards.
-    size_t len_at = o; o += 4;
-    size_t type_at = o;
-    memcpy(buf + o, "IDAT", 4); o += 4;
-    size_t data_at = o;
+    // Compress into the space after the IDAT header, then patch the length in.
+    size_t len_at = p; p += 4;
+    size_t type_at = p;
+    memcpy(buf + p, "IDAT", 4); p += 4;
+    size_t data_at = p;
 
-    buf[o++] = 0x78; buf[o++] = 0x01;          // zlib: deflate, 32K window
+    size_t z = zlib_deflate(g_raw, raw_len, buf + p, cap - p - 16);
+    if (!z) return 0;
+    p += z;
 
-    uint32_t a = 1, b = 0;                      // Adler-32, computed as we go
-    size_t written = 0;
-    int row = 0, col = 0;                       // position in the raw stream
-    while (written < raw_len) {
-        size_t block = raw_len - written;
-        if (block > 65535) block = 65535;
-        buf[o++] = (written + block >= raw_len) ? 1 : 0;   // BFINAL, stored
-        buf[o++] = (uint8_t)(block & 0xFF);
-        buf[o++] = (uint8_t)(block >> 8);
-        buf[o++] = (uint8_t)(~block & 0xFF);
-        buf[o++] = (uint8_t)((~block >> 8) & 0xFF);
+    put32(buf + len_at, (uint32_t)(p - data_at));
+    uint32_t c = crc32_of(buf + type_at, (p - data_at) + 4, 0);
+    put32(buf + p, c); p += 4;
 
-        for (size_t i = 0; i < block; i++) {
-            // Filter byte 0 at the start of every scanline, then the pixels.
-            uint8_t v;
-            if (col == 0) { v = 0; }
-            else          { v = g_idx[(size_t)row * g_w + (col - 1)]; }
-            buf[o++] = v;
-            a = (a + v) % 65521; b = (b + a) % 65521;
-            if (++col == 1 + g_w) { col = 0; row++; }
-        }
-        written += block;
-    }
-    put32(buf + o, (b << 16) | a); o += 4;      // Adler-32 of the raw stream
-
-    put32(buf + len_at, (uint32_t)(o - data_at));
-    uint32_t c = crc32_of(buf + type_at, (o - data_at) + 4, 0);
-    put32(buf + o, c); o += 4;
-
-    chunk(buf, &o, "IEND", NULL, 0);
-    return o;
+    chunk(buf, &p, "IEND", NULL, 0);
+    return p;
 }
 
 // ---------------------------------------------------------------- telegram
@@ -357,7 +512,35 @@ static size_t read_cb(char *dst, size_t sz, size_t nm, void *userp) {
     return want;
 }
 
+// Send, and try again if it fails.
+//
+// Not defensive padding: the failures here are intermittent, and that took
+// three ladders to see. A 4,093-byte frame failed in the same run where 2,907
+// bytes posted, and a 10,160-byte frame had posted fine the deploy before --
+// then the identical 2,907-byte frame failed two minutes after succeeding.
+// Every "ceiling" measured on this endpoint was a threshold read into noise.
+//
+// So the transport is unreliable rather than bounded, and the honest response
+// to an unreliable link is to retry it and to count how often that was needed.
+static int send_photo_once(const uint8_t *png, size_t png_len, const char *caption);
+
+static long g_sends, g_retries, g_failures;
+
 static int send_photo(const uint8_t *png, size_t png_len, const char *caption) {
+    for (int attempt = 1; attempt <= 4; attempt++) {
+        g_sends++;
+        if (send_photo_once(png, png_len, caption)) {
+            if (attempt > 1) printf("[+] delivered on attempt %d\n", attempt);
+            return 1;
+        }
+        g_retries++;
+        sleep(attempt * 3);          // 3s, 6s, 9s -- brief, widening
+    }
+    g_failures++;
+    return 0;
+}
+
+static int send_photo_once(const uint8_t *png, size_t png_len, const char *caption) {
     static const char *boundary = "----bmdemo7f3a91c2";
     g_body_len = build_multipart(boundary, caption, png, png_len);
     if (!g_body_len) { fprintf(stderr, "[!] frame did not fit the body buffer\n"); return 0; }
@@ -461,7 +644,7 @@ int main(int argc, char **argv) {
                  "machine can post.", g_w, g_h, n);
         int ok = send_photo(probe_png, n, cap);
         printf("[+] ladder %3dx%-3d png=%6zu bytes  %s\n", g_w, g_h, n,
-               ok ? "posted" : "FAILED");
+               ok ? "posted" : "FAILED after 4 attempts");
         if (!ok) break;
         chosen = LADDER[i];
         sleep(3);
@@ -492,18 +675,23 @@ int main(int argc, char **argv) {
         if (!png_len) { fprintf(stderr, "[!] png did not fit\n"); return 1; }
 
         double zoom = (3.0 / (double)g_w) / scale;
+        // %.0f rounded the first several frames to "1x" and made a zoom
+        // sequence look like it was standing still. Early frames need the
+        // decimal; later ones, at thousands, do not.
+        char zoomstr[32];
+        snprintf(zoomstr, sizeof(zoomstr), zoom < 100.0 ? "%.2f" : "%.0f", zoom);
         char caption[512];
         snprintf(caption, sizeof(caption),
-            "frame %ld  \xc2\xb7  zoom %.0fx  \xc2\xb7  %d iterations  \xc2\xb7  rendered twice in %lds\n"
+            "frame %ld  \xc2\xb7  zoom %sx  \xc2\xb7  %d iterations  \xc2\xb7  rendered twice in %lds\n"
             "%ld pixels disagreed between the two passes%s\n"
             "%dx%d PNG encoded by hand, in a 16 MiB machine with no operating system.",
-            frame, zoom, MAX_ITER, secs, bad,
+            frame, zoomstr, MAX_ITER, secs, bad,
             bad ? " \xe2\x80\x94 each red dot is this machine giving two different answers to the same arithmetic."
                 : " \xe2\x80\x94 clean frame.",
             g_w, g_h);
 
-        printf("[+] frame %ld zoom=%.0fx render=%lds disagreements=%ld png=%zu bytes\n",
-               frame, zoom, secs, bad, png_len);
+        printf("[+] frame %ld zoom=%sx render=%lds disagreements=%ld png=%zu bytes\n",
+               frame, zoomstr, secs, bad, png_len);
 
         if (!send_photo(png, png_len, caption))
             fprintf(stderr, "[!] frame %ld not delivered\n", frame);
