@@ -661,7 +661,14 @@ int main(int argc, char **argv) {
     g_w = g_h = chosen;
     printf("[+] settled on %dx%d\n", chosen, chosen);
 
-    double scale = 3.0 / (double)g_w;
+    // Track the field of view -- how much of the plane is on screen -- rather
+    // than the distance between pixels. They differ the moment the frame size
+    // changes: holding units-per-pixel fixed while dropping 320 to 256 keeps
+    // the detail and quietly crops a fifth of the picture away, so the
+    // sequence jumps instead of zooming. Holding the field of view fixed
+    // shows the same region at fewer pixels, which is what dropping
+    // resolution should mean.
+    double fov = 3.0;
     long frame = 0;
 
     for (;;) {
@@ -679,6 +686,7 @@ int main(int argc, char **argv) {
         // the simplest frame in the sequence is a size that stops working
         // three frames later.
         for (;;) {
+            double scale = fov / (double)g_w;
             t0 = time(NULL);
             render(g_pass1, scale);
             render(g_pass2, scale);  // the same work, again, on purpose
@@ -697,7 +705,7 @@ int main(int argc, char **argv) {
                    frame, png_len, g_budget, g_w, g_h);
         }
 
-        double zoom = (3.0 / (double)g_w) / scale;
+        double zoom = 3.0 / fov;
         // %.0f rounded the first several frames to "1x" and made a zoom
         // sequence look like it was standing still. Early frames need the
         // decimal; later ones, at thousands, do not.
@@ -720,8 +728,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[!] frame %ld not delivered\n", frame);
 
         if (FRAMES && frame >= FRAMES) break;
-        scale /= ZOOM_PER_FRAME;
-        if (scale < 1e-15) { scale = 3.0 / (double)g_w; printf("[+] precision floor, restarting the zoom\n"); }
+        fov /= ZOOM_PER_FRAME;
+        // Doubles run out of room at roughly 1e-15 per pixel; start over
+        // rather than post the grey mush that comes after.
+        if (fov / (double)g_w < 1e-15) { fov = 3.0; printf("[+] precision floor, restarting the zoom\n"); }
         sleep(FRAME_GAP);
     }
     curl_global_cleanup();

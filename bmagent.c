@@ -547,6 +547,513 @@ static int index_search(long long chat, const float *q, int k,
     return found;
 }
 
+
+// ============================================================ fractal
+//
+// The agent can draw. Not decoration: the picture is a measurement.
+//
+// A Mandelbrot escape count is a pure function of the pixel, so rendering a
+// frame twice must give the same image, byte for byte, on a correct machine.
+// This one disagrees with itself on 64-bit integer arithmetic about once in
+// four thousand results, measured against a Linux control under the same
+// hypervisor. Every frame here is rendered twice and the two passes compared,
+// with any pixel that differs painted red and counted.
+//
+// So far that count has always been zero, which is the finding: the fault is
+// in the integer path -- gcc lowering __uint128_t division to __udivti3 --
+// and not in the double-precision floating point this loop runs on.
+//
+// The PNG is written here too, deflate and all, because there is no zlib in
+// this image to link against.
+//
+// Budget, on top of the agent's own 9,588 KB:
+//
+//   escape counts x2   400 KB
+//   palette indices    100 KB
+//   raw scanlines      100 KB
+//   encoded PNG         64 KB
+//   multipart body      96 KB
+//   deflate tables      96 KB
+//   ------------------------
+//                      856 KB   -- 10.2 MiB of 16 in total
+
+#define FRACT_MAX    320       // largest frame; the link will not carry more
+#define MAX_ITER     600
+#define TARGET_RE   (-0.743643887037151)
+#define TARGET_IM   ( 0.131825904205330)
+
+static int g_w = 256, g_h = 256;
+static uint16_t g_pass1[FRACT_MAX * FRACT_MAX];
+static uint16_t g_pass2[FRACT_MAX * FRACT_MAX];
+static uint8_t  g_idx[FRACT_MAX * FRACT_MAX];
+static uint8_t  g_plte[256 * 3];
+static uint8_t  g_body[96 * 1024];
+static size_t   g_body_len;
+
+// ---------------------------------------------------------------- fractal
+
+// Escape-time iteration, double precision. Deliberately plain: the whole
+// exercise depends on this being a pure function of (cr, ci), so there is no
+// caching, no early-out on symmetry, and no reuse of anything between passes.
+static uint16_t escape(double cr, double ci) {
+    // Cardioid and period-2 bulb tests. These are exact algebraic checks that
+    // skip the interior, where the loop would otherwise always run to
+    // MAX_ITER -- worth it on a machine that computes 3.7x slower than Linux.
+    double q = (cr - 0.25) * (cr - 0.25) + ci * ci;
+    if (q * (q + (cr - 0.25)) <= 0.25 * ci * ci) return MAX_ITER;
+    if ((cr + 1.0) * (cr + 1.0) + ci * ci <= 0.0625) return MAX_ITER;
+
+    double zr = 0, zi = 0, zr2 = 0, zi2 = 0;
+    uint16_t i = 0;
+    while (i < MAX_ITER && zr2 + zi2 <= 4.0) {
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+        zr2 = zr * zr;
+        zi2 = zi * zi;
+        i++;
+    }
+    return i;
+}
+
+static void render(uint16_t *out, double scale) {
+    for (int y = 0; y < g_h; y++) {
+        double ci = TARGET_IM + ((double)y - g_h / 2.0) * scale;
+        for (int x = 0; x < g_w; x++) {
+            double cr = TARGET_RE + ((double)x - g_w / 2.0) * scale;
+            out[y * g_w + x] = escape(cr, ci);
+        }
+    }
+}
+
+#define PAL_BANDS   254   // 0..253 are escape colours
+#define PAL_INSIDE  254
+#define PAL_BAD     255
+
+// Three phases of one cosine give a smooth spectrum, evaluated once into a
+// 256-entry table rather than per pixel -- which is also what makes the image
+// a palette PNG, and a third of the bytes.
+static void build_palette(void) {
+    for (int k = 0; k < PAL_BANDS; k++) {
+        double s = (double)k / (double)PAL_BANDS;
+        g_plte[k * 3 + 0] = (uint8_t)(255.0 * (0.5 + 0.5 * cos(6.283 * (s + 0.00))));
+        g_plte[k * 3 + 1] = (uint8_t)(255.0 * (0.5 + 0.5 * cos(6.283 * (s + 0.33))));
+        g_plte[k * 3 + 2] = (uint8_t)(255.0 * (0.5 + 0.5 * cos(6.283 * (s + 0.67))));
+    }
+    g_plte[PAL_INSIDE * 3] = g_plte[PAL_INSIDE * 3 + 1] = g_plte[PAL_INSIDE * 3 + 2] = 8;
+    g_plte[PAL_BAD * 3 + 0] = 255;
+    g_plte[PAL_BAD * 3 + 1] = 0;
+    g_plte[PAL_BAD * 3 + 2] = 0;
+}
+
+static void colourise(const uint16_t *it) {
+    for (int i = 0; i < g_w * g_h; i++) {
+        uint16_t n = it[i];
+        if (n >= MAX_ITER) { g_idx[i] = PAL_INSIDE; continue; }
+        // sqrt rather than a linear ramp, and cycling rather than a single
+        // sweep. Most pixels in a wide view escape in under a dozen steps, so
+        // dividing by MAX_ITER puts almost the whole image in the first
+        // percent of the palette and the picture comes out one flat colour.
+        // Taking the root spreads the low counts, and letting the phase wrap
+        // draws the escape-time bands at every depth instead of only near the
+        // boundary.
+        double s = sqrt((double)n) * 0.13;
+        s -= floor(s);                             // the phase wraps; keep it in [0,1)
+        g_idx[i] = (uint8_t)(s * PAL_BANDS);
+    }
+}
+
+// Paint every pixel where the two passes disagreed. Returns how many.
+static long mark_disagreements(void) {
+    long bad = 0;
+    for (int i = 0; i < g_w * g_h; i++) {
+        if (g_pass1[i] != g_pass2[i]) { g_idx[i] = PAL_BAD; bad++; }
+    }
+    return bad;
+}
+
+// ---------------------------------------------------------------- png
+//
+// Hand-rolled, because porting zlib to link one function would have been the
+// larger job. The compression method is "none": deflate's stored block is a
+// five-byte header around at most 65535 literal bytes, so a valid zlib stream
+// is a two-byte header, a run of stored blocks, and an Adler-32. Every decoder
+// accepts it. The file is about the size of the raw pixels, which is a fair
+// trade for not having a compressor.
+
+static uint32_t crc_table[256];
+static int crc_ready;
+
+static void crc_init(void) {
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        crc_table[n] = c;
+    }
+    crc_ready = 1;
+}
+
+static uint32_t crc32_of(const uint8_t *buf, size_t len, uint32_t crc) {
+    if (!crc_ready) crc_init();
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) crc = crc_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+// Append a PNG chunk at *o, advancing it.
+static void chunk(uint8_t *base, size_t *o, const char *type,
+                  const uint8_t *data, size_t len) {
+    put32(base + *o, (uint32_t)len); *o += 4;
+    size_t type_at = *o;
+    memcpy(base + *o, type, 4); *o += 4;
+    if (len) { memcpy(base + *o, data, len); *o += len; }
+    uint32_t c = crc32_of(base + type_at, len + 4, 0);
+    put32(base + *o, c); *o += 4;
+}
+
+
+// ---------------------------------------------------------------- deflate
+//
+// Fixed-Huffman deflate with LZ77 matching, written here because there is no
+// zlib to link and the alternative was staying at 96x96.
+//
+// Stored blocks got the first version working, but they are not compression:
+// the file is the pixels plus five bytes per 64 KB. A real ceiling of about
+// 16 KB per HTTPS request to this endpoint therefore capped the picture at
+// 96x96, which is small enough to be disappointing.
+//
+// A Mandelbrot compresses extraordinarily well and it is worth seeing why: the
+// interior is one flat colour, the escape bands are long runs of one palette
+// index, and consecutive scanlines are nearly identical -- so a match at
+// distance (width + 1) reproduces most of a row from the row above it. LZ77
+// finds all three without being told about any of them.
+//
+// Fixed Huffman rather than dynamic: the code lengths are defined by the
+// standard, so there is no tree to build, no tree to serialise, and far less
+// to get wrong. Dynamic would beat it by perhaps a fifth, which is not worth
+// the extra hundred lines here.
+
+// Sizes the renderer will try, smallest first.
+static const int LADDER[] = { 64, 96, 128, 160, 192, 256, 320 };
+#define N_LADDER ((int)(sizeof(LADDER) / sizeof(LADDER[0])))
+// Largest body this link has been seen to carry. Measured the hard way: 14,240
+// bytes has been delivered, 17,065 has failed four attempts twice over.
+static size_t g_budget = 14000;
+
+#define DEF_WINDOW  16384
+#define DEF_MIN_MATCH 3
+#define DEF_MAX_MATCH 258
+#define DEF_HASH_BITS 13
+#define DEF_HASH_SIZE (1 << DEF_HASH_BITS)
+
+static uint8_t  *g_ob;          // output cursor state for the bit writer
+static size_t    g_ocap, g_olen;
+static uint32_t  g_bitbuf;
+static int       g_bitcnt;
+static int       g_overflow;
+static int32_t   g_head[DEF_HASH_SIZE];
+static int32_t   g_prev[DEF_WINDOW];
+
+static void bw_init(uint8_t *out, size_t cap) {
+    g_ob = out; g_ocap = cap; g_olen = 0;
+    g_bitbuf = 0; g_bitcnt = 0; g_overflow = 0;
+}
+
+// Deflate writes bits least-significant first within each byte.
+static void put_bits(uint32_t v, int n) {
+    g_bitbuf |= (v & ((1u << n) - 1u)) << g_bitcnt;
+    g_bitcnt += n;
+    while (g_bitcnt >= 8) {
+        if (g_olen < g_ocap) g_ob[g_olen++] = (uint8_t)(g_bitbuf & 0xFF);
+        else g_overflow = 1;
+        g_bitbuf >>= 8;
+        g_bitcnt -= 8;
+    }
+}
+
+// Huffman codes are defined most-significant bit first, which is the opposite
+// order to everything else in the format. Emitting them a bit at a time from
+// the top is slower than a reversal table and much harder to get wrong.
+static void put_code(uint32_t code, int len) {
+    for (int i = len - 1; i >= 0; i--) put_bits((code >> i) & 1u, 1);
+}
+
+static void bw_flush(void) {
+    if (g_bitcnt > 0) {
+        if (g_olen < g_ocap) g_ob[g_olen++] = (uint8_t)(g_bitbuf & 0xFF);
+        else g_overflow = 1;
+        g_bitbuf = 0; g_bitcnt = 0;
+    }
+}
+
+// The fixed literal/length code, straight from RFC 1951 section 3.2.6.
+static void put_literal(int sym) {
+    if (sym <= 143)      put_code(0x30u  + (uint32_t)sym, 8);
+    else if (sym <= 255) put_code(0x190u + (uint32_t)(sym - 144), 9);
+    else if (sym <= 279) put_code(0x0u   + (uint32_t)(sym - 256), 7);
+    else                 put_code(0xC0u  + (uint32_t)(sym - 280), 8);
+}
+
+static const uint16_t LEN_BASE[29] = {
+    3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
+static const uint8_t LEN_EXTRA[29] = {
+    0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
+static const uint16_t DIST_BASE[30] = {
+    1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+    1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
+static const uint8_t DIST_EXTRA[30] = {
+    0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
+
+static void put_match(int len, int dist) {
+    int lc = 28;
+    while (lc > 0 && len < LEN_BASE[lc]) lc--;
+    put_literal(257 + lc);
+    if (LEN_EXTRA[lc]) put_bits((uint32_t)(len - LEN_BASE[lc]), LEN_EXTRA[lc]);
+
+    int dc = 29;
+    while (dc > 0 && dist < DIST_BASE[dc]) dc--;
+    put_code((uint32_t)dc, 5);                      // distance codes are 5 bits fixed
+    if (DIST_EXTRA[dc]) put_bits((uint32_t)(dist - DIST_BASE[dc]), DIST_EXTRA[dc]);
+}
+
+static uint32_t dhash(const uint8_t *p) {
+    return (uint32_t)(((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (DEF_HASH_SIZE - 1));
+}
+
+// Compress src into a zlib stream at out. Returns bytes written, 0 on overflow.
+static size_t zlib_deflate(const uint8_t *src, size_t len, uint8_t *out, size_t cap) {
+    bw_init(out, cap);
+    if (cap < 8) return 0;
+    g_ob[g_olen++] = 0x78;                          // CMF: deflate, 32K window
+    g_ob[g_olen++] = 0x01;                          // FLG: (0x7801 % 31) == 0
+    put_bits(1, 1);                                 // BFINAL
+    put_bits(1, 2);                                 // BTYPE: fixed Huffman
+
+    for (int i = 0; i < DEF_HASH_SIZE; i++) g_head[i] = -1;
+
+    size_t pos = 0;
+    while (pos < len) {
+        int best_len = 0, best_dist = 0;
+        if (pos + DEF_MIN_MATCH <= len) {
+            uint32_t h = dhash(src + pos);
+            int32_t cand = g_head[h];
+            // One chain, bounded: the data is mostly long runs, so the first
+            // few candidates are as good as the hundredth and the search is
+            // where all the time would go.
+            int tries = 16;
+            while (cand >= 0 && tries-- > 0) {
+                size_t dist = pos - (size_t)cand;
+                if (dist == 0 || dist > DEF_WINDOW) break;
+                size_t maxl = len - pos;
+                if (maxl > DEF_MAX_MATCH) maxl = DEF_MAX_MATCH;
+                size_t l = 0;
+                while (l < maxl && src[cand + l] == src[pos + l]) l++;
+                if ((int)l > best_len) { best_len = (int)l; best_dist = (int)dist; }
+                if (best_len >= (int)maxl) break;
+                cand = g_prev[(size_t)cand & (DEF_WINDOW - 1)];
+            }
+        }
+
+        if (best_len >= DEF_MIN_MATCH) {
+            put_match(best_len, best_dist);
+            for (int k = 0; k < best_len; k++) {
+                if (pos + DEF_MIN_MATCH <= len) {
+                    uint32_t h = dhash(src + pos);
+                    g_prev[pos & (DEF_WINDOW - 1)] = g_head[h];
+                    g_head[h] = (int32_t)pos;
+                }
+                pos++;
+            }
+        } else {
+            put_literal(src[pos]);
+            if (pos + DEF_MIN_MATCH <= len) {
+                uint32_t h = dhash(src + pos);
+                g_prev[pos & (DEF_WINDOW - 1)] = g_head[h];
+                g_head[h] = (int32_t)pos;
+            }
+            pos++;
+        }
+        if (g_overflow) return 0;
+    }
+
+    put_literal(256);                               // end of block
+    bw_flush();
+
+    uint32_t a = 1, b = 0;
+    for (size_t i = 0; i < len; i++) { a = (a + src[i]) % 65521; b = (b + a) % 65521; }
+    if (g_olen + 4 > g_ocap) return 0;
+    put32(g_ob + g_olen, (b << 16) | a); g_olen += 4;
+    return g_overflow ? 0 : g_olen;
+}
+
+// Encode g_idx + g_plte into buf, returning the byte count (0 if it would not fit).
+static uint8_t g_raw[(FRACT_MAX + 1) * FRACT_MAX];      // filter byte + indices, per scanline
+
+static size_t png_encode(uint8_t *buf, size_t cap) {
+    const size_t raw_len = (size_t)g_h * (1 + (size_t)g_w);
+    if (raw_len > sizeof(g_raw)) return 0;
+    if (cap < 8 + 25 + (12 + 768) + 12 + 12) return 0;
+
+    // Filter type 0 (None) on every scanline. Filtering exists to make bytes
+    // more compressible, but a palette index is a label rather than a
+    // magnitude -- subtracting one index from another produces noise, not a
+    // small number. Leaving the rows alone lets the matcher find them whole:
+    // a scanline that repeats the one above it becomes a single match at
+    // distance width+1.
+    size_t o = 0;
+    for (int y = 0; y < g_h; y++) {
+        g_raw[o++] = 0;
+        memcpy(g_raw + o, g_idx + (size_t)y * g_w, (size_t)g_w);
+        o += (size_t)g_w;
+    }
+
+    size_t p = 0;
+    static const uint8_t sig[8] = { 137, 'P', 'N', 'G', '\r', '\n', 26, '\n' };
+    memcpy(buf, sig, 8); p = 8;
+
+    uint8_t ihdr[13];
+    put32(ihdr, (uint32_t)g_w); put32(ihdr + 4, (uint32_t)g_h);
+    ihdr[8] = 8;    // bit depth
+    ihdr[9] = 3;    // colour type: palette
+    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    chunk(buf, &p, "IHDR", ihdr, sizeof(ihdr));
+    chunk(buf, &p, "PLTE", g_plte, sizeof(g_plte));
+
+    // Compress into the space after the IDAT header, then patch the length in.
+    size_t len_at = p; p += 4;
+    size_t type_at = p;
+    memcpy(buf + p, "IDAT", 4); p += 4;
+    size_t data_at = p;
+
+    size_t z = zlib_deflate(g_raw, raw_len, buf + p, cap - p - 16);
+    if (!z) return 0;
+    p += z;
+
+    put32(buf + len_at, (uint32_t)(p - data_at));
+    uint32_t c = crc32_of(buf + type_at, (p - data_at) + 4, 0);
+    put32(buf + p, c); p += 4;
+
+    chunk(buf, &p, "IEND", NULL, 0);
+    return p;
+}
+
+
+// Wrap the PNG in a multipart body: sendPhoto wants a file part, and building
+// the envelope by hand avoids depending on curl's MIME API being present in
+// the port.
+static size_t build_multipart(const char *boundary, const char *chat,
+                              const char *caption,
+                              const uint8_t *png, size_t png_len) {
+    size_t o = 0;
+    o += (size_t)snprintf((char *)g_body + o, sizeof(g_body) - o,
+        "--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n"
+        "--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n"
+        "--%s\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"frame.png\"\r\n"
+        "Content-Type: image/png\r\n\r\n",
+        boundary, chat, boundary, caption, boundary);
+    if (o + png_len + 128 > sizeof(g_body)) return 0;
+    memcpy(g_body + o, png, png_len); o += png_len;
+    o += (size_t)snprintf((char *)g_body + o, sizeof(g_body) - o,
+                          "\r\n--%s--\r\n", boundary);
+    return o;
+}
+
+// Feed the body to curl a chunk at a time instead of handing it a pointer.
+//
+// CURLOPT_POSTFIELDS with CURLOPT_POSTFIELDSIZE is supposed to send exactly
+// that many bytes whatever they contain. On Linux it does. In this port a
+// frame never arrived at any size -- while an ASCII body of the same length
+// went through fine -- and a PNG has its first NUL nine bytes in, at the end
+// of the signature. A body truncated at that NUL, with Content-Length still
+// promising the rest, leaves the server waiting for data that never comes and
+// eventually closing: which is the error we saw, at every size we tried.
+//
+// A read callback sidesteps the question entirely. It is also what curl's own
+// documentation recommends for anything that is not a C string.
+struct upload { const uint8_t *p; size_t left; };
+
+static size_t read_cb(char *dst, size_t sz, size_t nm, void *userp) {
+    struct upload *u = (struct upload *)userp;
+    size_t want = sz * nm;
+    if (want > u->left) want = u->left;
+    if (want) { memcpy(dst, u->p, want); u->p += want; u->left -= want; }
+    return want;
+}
+
+// Send, and try again if it fails.
+//
+// Not defensive padding: the failures here are intermittent, and that took
+// three ladders to see. A 4,093-byte frame failed in the same run where 2,907
+// bytes posted, and a 10,160-byte frame had posted fine the deploy before --
+// then the identical 2,907-byte frame failed two minutes after succeeding.
+// Every "ceiling" measured on this endpoint was a threshold read into noise.
+//
+// So the transport is unreliable rather than bounded, and the honest response
+// to an unreliable link is to retry it and to count how often that was needed.
+static long g_sends, g_retries, g_failures;
+
+static int send_photo_once(const uint8_t *png, size_t png_len, const char *caption);
+
+static int send_photo(const uint8_t *png, size_t png_len, const char *caption) {
+    for (int attempt = 1; attempt <= 4; attempt++) {
+        g_sends++;
+        if (send_photo_once(png, png_len, caption)) {
+            if (attempt > 1) printf("[+] delivered on attempt %d\n", attempt);
+            return 1;
+        }
+        g_retries++;
+        sleep(attempt * 3);          // 3s, 6s, 9s -- brief, widening
+    }
+    g_failures++;
+    return 0;
+}
+
+static int send_photo_once(const uint8_t *png, size_t png_len, const char *caption) {
+    static const char *boundary = "----bmdemo7f3a91c2";
+    char chat[32];
+    snprintf(chat, sizeof(chat), "%lld", g_current_chat);
+    g_body_len = build_multipart(boundary, chat, caption, png, png_len);
+    if (!g_body_len) { fprintf(stderr, "[!] frame did not fit the body buffer\n"); return 0; }
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", g_tg_token);
+    char ctype[128];
+    snprintf(ctype, sizeof(ctype), "Content-Type: multipart/form-data; boundary=%s", boundary);
+
+    CURL *h = curl_easy_init();
+    if (!h) return 0;
+    struct curl_slist *hdrs = curl_slist_append(NULL, ctype);
+    hdrs = curl_slist_append(hdrs, "Expect:");   // no 100-continue round trip
+
+    g_sink.len = 0; g_sink.overflow = 0; g_http[0] = '\0';
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    struct upload up = { g_body, g_body_len };
+    curl_easy_setopt(h, CURLOPT_POST, 1L);
+    curl_easy_setopt(h, CURLOPT_READFUNCTION, read_cb);
+    curl_easy_setopt(h, CURLOPT_READDATA, &up);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)g_body_len);
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    common_opts(h);
+    set_ca_bundle(h);
+
+    CURLcode res = curl_easy_perform(h);
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(h);
+
+    if (res != CURLE_OK) { fprintf(stderr, "[!] send: %s\n", curl_easy_strerror(res)); return 0; }
+    if (status != 200)   { fprintf(stderr, "[!] send: HTTP %ld %.200s\n", status, g_http); return 0; }
+    return 1;
+}
+
+
+// ============================================================ end fractal
+
 // ---------------------------------------------------------------- tools
 //
 // Every tool answers a question about the machine this program is running on.
@@ -599,6 +1106,12 @@ static const char *TOOLS_JSON =
 "        \"query\":{\"type\":\"string\",\"description\":\"What to look for, as a phrase or question.\"},"
 "        \"k\":{\"type\":\"integer\",\"description\":\"How many of the closest notes to return. Default 3, at most 8.\"}},"
 "        \"required\":[\"query\"]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"draw_fractal\","
+"     \"description\":\"Draw the Mandelbrot set and send it to this chat as a picture. Use when someone asks for a fractal, a picture, or a demonstration that you can compute something visible. Renders every frame twice and marks in red any pixel where this machine disagreed with itself.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{"
+"        \"zoom\":{\"type\":\"number\",\"description\":\"How far in to zoom. 1 is the whole set; 1000 is deep. Default 1.\"}},"
+"        \"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"usage_stats\","
 "     \"description\":\"How much this machine has been used: messages answered, how many different people have talked to it, and how many times it has been restarted. Counted across every restart, not just this one.\","
@@ -700,7 +1213,10 @@ static void tool_memory_usage(void) {
         cJSON_AddNumberToObject(o, "last_search_microseconds",
                                 (double)g_vlast_search_cycles * 1e6 / (double)g_tsc_hz);
 
-    size_t total = ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES + index_bytes;
+    size_t fractal_bytes = sizeof(g_pass1) + sizeof(g_pass2) + sizeof(g_idx) + sizeof(g_plte)
+                        + sizeof(g_raw) + sizeof(g_body) + sizeof(g_head) + sizeof(g_prev);
+    cJSON_AddNumberToObject(o, "fractal_renderer_bytes", (double)fractal_bytes);
+    size_t total = ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES + index_bytes + fractal_bytes;
     cJSON_AddNumberToObject(o, "static_total_bytes", (double)total);
     cJSON_AddNumberToObject(o, "machine_ram_bytes", (double)RAM_MIB * 1024.0 * 1024.0);
     cJSON_AddNumberToObject(o, "percent_of_machine_claimed",
@@ -1382,6 +1898,69 @@ static void tool_usage_stats(void) {
     cJSON_Delete(o);
 }
 
+
+// Draw a frame and send it to whoever asked. The model picks how far in to
+// zoom; everything else -- where to look, how many iterations, what size the
+// link will carry -- is decided here, because those are not judgement calls.
+static void tool_draw_fractal(const cJSON *args) {
+    cJSON *z = cJSON_GetObjectItemCaseSensitive(args, "zoom");
+    double zoom = cJSON_IsNumber(z) ? z->valuedouble : 1.0;
+    if (!(zoom >= 1.0)) zoom = 1.0;              // also catches NaN
+    if (zoom > 1e12) zoom = 1e12;                // past this, doubles give mush
+
+    build_palette();
+    double fov = 3.0 / zoom;
+
+    // Start at the largest size and step down until the frame fits what this
+    // link has actually carried. Same rule the standalone renderer uses: a
+    // deeper zoom holds more detail and compresses worse, so the size that
+    // worked last time is not a size that works this time.
+    g_w = g_h = FRACT_MAX;
+    static uint8_t png[64 * 1024];
+    size_t png_len = 0;
+    long bad = 0;
+    time_t t0 = time(NULL);
+
+    for (;;) {
+        double scale = fov / (double)g_w;
+        render(g_pass1, scale);
+        render(g_pass2, scale);                  // the same work, again, on purpose
+        colourise(g_pass1);
+        bad = mark_disagreements();
+        png_len = png_encode(png, sizeof(png));
+        if (png_len && png_len <= g_budget) break;
+        int i = 0;
+        while (i < N_LADDER - 1 && LADDER[i] < g_w) i++;
+        if (i == 0) break;
+        g_w = g_h = LADDER[i - 1];
+    }
+    long secs = (long)(time(NULL) - t0);
+
+    if (!png_len) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"could not encode the frame\"}");
+        return;
+    }
+
+    char caption[400];
+    snprintf(caption, sizeof(caption),
+        "zoom %.0fx \xc2\xb7 %dx%d \xc2\xb7 %d iterations \xc2\xb7 rendered twice in %lds\n"
+        "%ld pixels disagreed between the passes%s",
+        zoom, g_w, g_h, MAX_ITER, secs, bad,
+        bad ? " \xe2\x80\x94 each red dot is this machine answering the same sum two ways."
+            : " \xe2\x80\x94 clean.");
+
+    int sent = send_photo(png, png_len, caption);
+    snprintf(g_result, sizeof(g_result),
+        "{\"sent\":%s,\"zoom\":%.0f,\"pixels\":\"%dx%d\",\"png_bytes\":%zu,"
+        "\"render_seconds\":%ld,\"pixels_disagreeing\":%ld,\"retries\":%ld,"
+        "\"note\":\"%s\"}",
+        sent ? "true" : "false", zoom, g_w, g_h, png_len, secs, bad, g_retries,
+        sent ? "The picture has already been delivered to this chat. Say what is in it "
+               "and what the numbers mean; do not describe it as if they cannot see it."
+             : "The picture could not be delivered. Say so plainly.");
+}
+
 static void call_tool(const char *name, const cJSON *args) {
     if      (strcmp(name, "machine_facts") == 0) tool_machine_facts();
     else if (strcmp(name, "memory_usage")  == 0) tool_memory_usage();
@@ -1391,6 +1970,7 @@ static void call_tool(const char *name, const cJSON *args) {
     else if (strcmp(name, "usage_stats")    == 0) tool_usage_stats();
     else if (strcmp(name, "recall")        == 0) tool_recall();
     else if (strcmp(name, "recall_similar")== 0) tool_recall_similar(args);
+    else if (strcmp(name, "draw_fractal")  == 0) tool_draw_fractal(args);
     else if (strcmp(name, "list_reminders") == 0) tool_list_reminders();
     else if (strcmp(name, "remind_me") == 0) {
         if (args) tool_remind_me(args);
@@ -1811,12 +2391,16 @@ int main(int argc, char **argv) {
     // were the honest number when the buffers were all there was.
     {
         size_t idx = sizeof(g_vec) + sizeof(g_vtext) + sizeof(g_vchat);
-        size_t stat_total = ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES + idx;
+        size_t frac = sizeof(g_pass1) + sizeof(g_pass2) + sizeof(g_idx) + sizeof(g_plte)
+                        + sizeof(g_raw) + sizeof(g_body) + sizeof(g_head) + sizeof(g_prev);
+        size_t stat_total = ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES + idx + frac;
         printf("[+] BareMetal agent up. model=%s ram=%d MiB static=%zu KB (%.0f%% of RAM) max_steps=%d\n",
                g_llm_model, RAM_MIB, stat_total / 1024,
                (double)stat_total * 100.0 / ((double)RAM_MIB * 1024.0 * 1024.0), MAX_STEPS);
         printf("[+] semantic index: %d slots x %d dims = %zu KB resident, searched in RAM\n",
                VEC_MAX, VEC_DIM, idx / 1024);
+        printf("[+] fractal renderer: up to %dx%d, %zu KB of buffers, PNG encoder included\n",
+               FRACT_MAX, FRACT_MAX, frac / 1024);
     }
     printf("[+] web search: %s   memory: %s\n",
            g_web_enabled ? "on" : "off", g_memory_enabled ? "on" : "off");

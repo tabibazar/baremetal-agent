@@ -71,6 +71,7 @@ The first four report on the machine the agent is living inside, which is the po
 | `remember` | keeps one fact about the person it is talking to |
 | `recall` | everything it has kept about them |
 | `recall_similar` | the same notes searched by meaning, against a vector index held in RAM |
+| `draw_fractal` | renders the Mandelbrot set and sends it as a picture, twice over |
 | `remind_me` | sends them a message at a future time, surviving restarts |
 | `list_reminders` | what they have pending, and when each is due |
 | `usage_stats` | messages answered, different people, restarts — counted across all of them |
@@ -79,7 +80,31 @@ The first four report on the machine the agent is living inside, which is the po
 people who just want to talk to it — every feature, every limit, and real
 transcripts rather than invented ones.
 
-## bmdemo — a fractal renderer with no graphics library
+## draw_fractal — the agent draws, and the drawing is a measurement
+
+Ask the bot for a fractal and it renders one, encodes a PNG, and sends it. No
+GPU, no graphics library, no image library — arithmetic and a socket. The
+deflate encoder is in this repository because there is no zlib in the image to
+link against.
+
+It renders every frame **twice**. An escape count is a pure function of the
+pixel, so a correct machine returns the same image both times by construction,
+and any pixel where the two passes differ is painted red and counted in the
+caption. Every frame so far has been clean, which is the finding: the
+[measured corruption](https://github.com/tabibazar/unikernel-c/tree/main/docs/nanos-vs-baremetal)
+is in 64-bit integer modular arithmetic, and this loop is double-precision
+floating point.
+
+The model chooses one thing, the zoom, because that is the only judgement call.
+Where to look, the iteration count, the frame size, the retry policy and the
+byte budget are decided in C.
+
+It was a separate program first (`bmdemo.c`, still here and still buildable),
+which is how the two transport bugs below were found. Folding it into the agent
+took the footprint from 9,588 KB to 10.3 MiB — 64% of the machine — and freed
+the second instance.
+
+## bmdemo — the standalone renderer
 
 `bmdemo.c` renders the Mandelbrot set as a BareMetal unikernel and posts frames
 to Telegram. No GPU, no graphics library, no image library, no operating
