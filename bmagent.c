@@ -67,6 +67,7 @@
 // interface works; the URL and token are the only things that change.
 #define KV_URL_DEFAULT         "PUT_KV_URL_HERE"
 #define KV_TOKEN_DEFAULT       "PUT_KV_TOKEN_HERE"
+#define RECALL_SHOWN           25        // how many of them plain recall returns
 #define NOTES_KEPT             100       // per person, oldest dropped. Was 20,
                                          // sized for a machine that indexed
                                          // nothing; the RAM-resident index
@@ -361,8 +362,10 @@ static const char *env_or(const char *name, const char *fallback) {
 #define VEC_DIM      768       // the model natively returns 3072; see below
 #define VEC_MAX      2560
 #define VEC_TEXT     192       // per-entry copy, so a search touches no network
-#define EMBED_BATCH  4         // one response is ~24 KB per vector
-#define BACKFILL_MAX 32        // notes re-embedded on first search after a boot
+#define EMBED_BATCH  8         // ~24 KB of response per vector, so ~190 KB of the
+                               // 256 KB HTTP buffer -- the largest batch that fits
+#define BACKFILL_MAX NOTES_KEPT // restore ALL of them: a note the index cannot see
+                                // is one plain recall already showed anyway
 
 static float     g_vec[VEC_MAX][VEC_DIM];
 static char      g_vtext[VEC_MAX][VEC_TEXT];
@@ -474,7 +477,7 @@ static int chat_backfilled(long long chat) {
     return 0;
 }
 
-static int load_notes_list(cJSON **reply_out);   // defined with the memory tools
+static int load_notes_list(cJSON **reply_out, int count);   // with the memory tools
 
 // The index lives in RAM, so a restart empties it while the notes themselves
 // survive in Redis. On the first search in a chat after a boot, re-embed what
@@ -486,7 +489,7 @@ static int index_backfill(long long chat) {
         g_vbackfilled[g_vbackfill_count++] = chat;
 
     cJSON *reply = NULL;
-    if (!load_notes_list(&reply)) return 0;
+    if (!load_notes_list(&reply, BACKFILL_MAX)) return 0;
     cJSON *res = cJSON_GetObjectItemCaseSensitive(reply, "result");
     if (!cJSON_IsArray(res)) return 0;
 
@@ -587,7 +590,7 @@ static const char *TOOLS_JSON =
 "     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"recall\","
-"     \"description\":\"Everything you have kept about the person you are talking to.\","
+"     \"description\":\"The most recent notes you have kept about this person, in order. Use it to get your bearings, or when they ask what you know in general. For a question about a particular topic, recall_similar is the better tool -- it searches all of them, not just the recent ones.\","
 "     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"recall_similar\","
@@ -986,7 +989,7 @@ static void tool_remember(const cJSON *args) {
 // This chat's notes, still as a JSON array. Shared by the text recall below
 // and by the index backfill, which needs the notes one at a time rather than
 // run together into a paragraph.
-static int load_notes_list(cJSON **reply_out) {
+static int load_notes_list(cJSON **reply_out, int count) {
     if (!g_memory_enabled) return 0;
     char key[64];
     notes_key(key, sizeof(key));
@@ -995,7 +998,16 @@ static int load_notes_list(cJSON **reply_out) {
     if (!cmd) return 0;
     cJSON_AddItemToArray(cmd, cJSON_CreateString("LRANGE"));
     cJSON_AddItemToArray(cmd, cJSON_CreateString(key));
-    cJSON_AddItemToArray(cmd, cJSON_CreateString("0"));
+    // How far back to read is the caller's business, and the two callers want
+    // different things. Plain recall wants the most recent RECALL_SHOWN, because
+    // a hundred notes do not fit the buffer they are read into and would be
+    // truncated mid-sentence with nothing to say they had been. The index wants
+    // everything, because notes older than the recall window are precisely the
+    // ones it exists to find -- capping both at the same number made the index
+    // blind to exactly the material that justified building it.
+    char lo[16];
+    snprintf(lo, sizeof(lo), "-%d", count);
+    cJSON_AddItemToArray(cmd, cJSON_CreateString(lo));
     cJSON_AddItemToArray(cmd, cJSON_CreateString("-1"));
 
     cJSON *reply = kv_command(cmd);
@@ -1007,7 +1019,7 @@ static int load_notes_list(cJSON **reply_out) {
 // Reads this chat's notes into g_result. Also used to preload a conversation.
 static int load_notes(char *out, size_t out_sz) {
     cJSON *reply = NULL;
-    if (!load_notes_list(&reply)) return 0;
+    if (!load_notes_list(&reply, RECALL_SHOWN)) return 0;
     cJSON *res = cJSON_GetObjectItemCaseSensitive(reply, "result");
     if (!cJSON_IsArray(res) || cJSON_GetArraySize(res) == 0) return 0;
 
@@ -1022,6 +1034,8 @@ static int load_notes(char *out, size_t out_sz) {
     return o > 0;
 }
 
+static long kv_number(const char *cmd_name, const char *key, long fallback);
+
 static void tool_recall(void) {
     if (!g_memory_enabled) {
         snprintf(g_result, sizeof(g_result), "{\"error\":\"no memory configured\"}");
@@ -1033,9 +1047,22 @@ static void tool_recall(void) {
                  "{\"notes\":[],\"note\":\"nothing remembered about this person yet\"}");
         return;
     }
+    char key[64];
+    notes_key(key, sizeof(key));
+    long total = kv_number("LLEN", key, 0);
+
     cJSON *o = cJSON_CreateObject();
     if (!o) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
     cJSON_AddStringToObject(o, "notes", notes);
+    // Say what is missing rather than quietly returning a subset: an agent that
+    // reports "that is everything" while holding back seventy notes is worse
+    // than one that says where the rest are.
+    if (total > RECALL_SHOWN) {
+        cJSON_AddNumberToObject(o, "showing_most_recent", RECALL_SHOWN);
+        cJSON_AddNumberToObject(o, "total_kept", total);
+        cJSON_AddStringToObject(o, "older_notes",
+            "Not shown here. Use recall_similar to search all of them by meaning.");
+    }
     cJSON_AddStringToObject(o, "stored_in",
         "Redis, reached over HTTPS. This machine has no disk, so anything it keeps lives "
         "on the network.");
@@ -1423,7 +1450,10 @@ static void call_tool(const char *name, const cJSON *args) {
     "You have a memory that survives being restarted, kept on another machine because " \
     "you have no disk of your own. When someone tells you something worth keeping about " \
     "themselves, keep it. What you already know about them is given to you before their " \
-    "message, so use it naturally rather than announcing that you looked.\n\n" \
+    "message, so use it naturally rather than announcing that you looked. Only the most " \
+    "recent notes are given to you that way, so before telling someone you do not know " \
+    "something about THEM or their life, search with recall_similar first — the answer is " \
+    "often something they told you long enough ago that it is no longer in front of you.\n\n" \
     "Never announce that you are about to use a tool — just use it, and then answer. " \
     "Saying 'I need to search for that' and stopping leaves the person with nothing, " \
     "because they cannot see your tools; all they get is the sentence.\n\n" \

@@ -128,8 +128,17 @@ crash, and it cannot invent a memory that was never stored. Anything depending
 on exact arithmetic would have been the wrong thing to build on this machine.
 
 The index lives in RAM, so a restart empties it while the notes themselves
-survive in Redis. The first search in a conversation after a boot re-embeds the
-most recent 32 notes to refill it. Per-chat isolation is preserved throughout:
+survive in Redis. The first search in a conversation after a boot re-embeds
+every note that chat has, in batches of eight, to refill it — costing a few
+seconds once per conversation per boot.
+
+That backfill and plain `recall` read the same Redis list through the same
+function, and briefly shared a row limit, which quietly broke the feature:
+capping both at the 25 notes `recall` can display left the index able to see
+only the notes `recall` was already showing, so the older material the index
+exists to find became invisible. `test_live.c` catches it — the restored count
+comes back in the tool result, so `restored=25` against a 30-note list is
+visible rather than inferred. Per-chat isolation is preserved throughout:
 every vector carries the chat it came from and a search never crosses between
 them, which `test_index.c` checks explicitly.
 
