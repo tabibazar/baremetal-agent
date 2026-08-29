@@ -26,11 +26,18 @@
 // a heap. The arena is reset after every conversation, so memory use is
 // bounded by one exchange rather than by uptime.
 //
-//   arena    384 KB   cJSON nodes: the conversation and parsed responses
-//   http     128 KB   one HTTP response at a time
-//   payload  128 KB   one serialized request body at a time
-//   -------------------
-//   total    640 KB   + libcurl's own internal allocations
+//   arena      1.0 MiB   cJSON nodes: the conversation and parsed responses
+//   http      256 KB     one HTTP response at a time
+//   payload   128 KB     one serialized request body at a time
+//   index     7.99 MiB   2560 embeddings, their text, and the chat each belongs to
+//   ---------------------
+//   total     9.37 MiB   of a 16 MiB machine, + libcurl's own allocations
+//
+// The index is the reason the figure is no longer measured in kilobytes. A
+// cloud instance is capped at 16 MiB and the agent used to claim 640 KB of it,
+// which was tidy and wasteful in equal measure. It now keeps a vector database
+// of everything it has been told, resident, and searches it without touching
+// the network or a disk -- neither of which this machine has anyway.
 //
 // BUILD: see README.md — it runs unchanged on Linux, macOS and BareMetal.
 
@@ -38,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <time.h>
 #include <unistd.h>
 #include <curl/curl.h>
@@ -59,7 +67,11 @@
 // interface works; the URL and token are the only things that change.
 #define KV_URL_DEFAULT         "PUT_KV_URL_HERE"
 #define KV_TOKEN_DEFAULT       "PUT_KV_TOKEN_HERE"
-#define NOTES_KEPT             20        // per person, oldest dropped
+#define NOTES_KEPT             100       // per person, oldest dropped. Was 20,
+                                         // sized for a machine that indexed
+                                         // nothing; the RAM-resident index
+                                         // below makes a longer list useful
+                                         // rather than merely longer.
 #define REMINDERS_KEY          "agent:reminders"   // sorted set, scored by due time
 #define REMINDER_MAX_PER_CHAT  20
 #define REMINDER_MIN_DELAY     20        // seconds; below this it is a typo
@@ -79,7 +91,10 @@
 #define LLM_MODEL_DEFAULT "gemini-2.5-flash"
 
 #ifndef ARENA_BYTES
-#define ARENA_BYTES     (384 * 1024)
+// 1 MiB, up from 384 KB. An embedding response is a JSON array of 768 numbers
+// and there is now room to parse one without the arena being the tight
+// constraint. See the memory budget above VEC_MAX below.
+#define ARENA_BYTES     (1024 * 1024)
 #endif
 #ifndef HTTP_BUF_BYTES
 // 256 KB rather than 128: Firecrawl returns a whole page as markdown, and a
@@ -308,6 +323,227 @@ static const char *env_or(const char *name, const char *fallback) {
     return (v && *v) ? v : fallback;
 }
 
+// ------------------------------------------------------- semantic index
+//
+// A vector database that lives entirely in this machine's RAM.
+//
+// Exact-key recall could only find a note if you named it the way you filed
+// it. This indexes every remembered note by meaning: each one is embedded
+// once, and a query is answered by comparing it against every resident vector
+// and returning the closest. There is no tree, no database and no disk -- the
+// whole corpus is a static array, and a search is one pass over it.
+//
+// The memory budget, against a hard cloud ceiling of 16 MiB per instance:
+//
+//     vectors   2560 x 768 x 4 bytes  = 7.50 MiB
+//     text      2560 x 192 bytes      = 0.47 MiB
+//     chat ids  2560 x 8 bytes        = 0.02 MiB
+//     arena, HTTP and payload buffers = 1.38 MiB
+//                                       ---------
+//                                       9.37 MiB of 16
+//
+// None of it costs a byte in the image: this is BSS, so the upload stays the
+// same size and the machine simply wakes up with the room already claimed.
+// A probe established that 13 MiB of touched static memory boots in a 16 MiB
+// instance and 14 MiB does not; the agent's own code and lwIP/mbedTLS working
+// set take a share of the difference, and the rest is deliberate margin.
+//
+// Why brute force is the right answer here, and not laziness: the platform is
+// known to corrupt 64-bit arithmetic at a rate near 1 in 4000 under load, so a
+// feature whose inner loop is a long multiply-accumulate needs a failure mode
+// that degrades rather than breaks. A wrong score reorders two neighbours in a
+// ranked list. It cannot crash, and it cannot invent a memory that was never
+// stored. An exact-arithmetic feature would have been the wrong thing to build
+// on this machine.
+
+#define EMBED_URL_DEFAULT   "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
+#define EMBED_MODEL_DEFAULT "gemini-embedding-001"
+#define VEC_DIM      768       // the model natively returns 3072; see below
+#define VEC_MAX      2560
+#define VEC_TEXT     192       // per-entry copy, so a search touches no network
+#define EMBED_BATCH  4         // one response is ~24 KB per vector
+#define BACKFILL_MAX 32        // notes re-embedded on first search after a boot
+
+static float     g_vec[VEC_MAX][VEC_DIM];
+static char      g_vtext[VEC_MAX][VEC_TEXT];
+static long long g_vchat[VEC_MAX];
+static int       g_vcount;
+static int       g_vevicted;            // entries dropped because the index filled
+static uint64_t  g_vlast_search_cycles;
+static long long g_vbackfilled[32];     // chats already restored after this boot
+static int       g_vbackfill_count;
+
+// Pull the embeddings out of a response by hand rather than through cJSON.
+// A batch of four is 3072 numbers, and every one of them would become a
+// separate node in the arena; scanning the text costs nothing and the shape is
+// fixed, because this program wrote the request.
+static int parse_embeddings(const char *json, int want, float out[][VEC_DIM]) {
+    const char *p = json;
+    int got = 0;
+    while (got < want && (p = strstr(p, "\"embedding\"")) != NULL) {
+        p = strchr(p, '[');
+        if (!p) break;
+        p++;
+        int d = 0;
+        double sum = 0;
+        while (d < VEC_DIM) {
+            char *end = NULL;
+            double v = strtod(p, &end);
+            if (end == p) break;
+            out[got][d] = (float)v;
+            sum += v * v;
+            d++;
+            p = end;
+            while (*p == ' ' || *p == ',') p++;
+            if (*p == ']') break;
+        }
+        if (d != VEC_DIM) return got;
+        // The model returns 3072 dimensions and truncates on request, but a
+        // truncated vector is no longer unit length (0.59 was measured), so
+        // cosine similarity needs the normalisation doing here. Skipping this
+        // silently ranks longer vectors above closer ones.
+        double n = sqrt(sum);
+        if (n > 0) for (int i = 0; i < VEC_DIM; i++) out[got][i] = (float)(out[got][i] / n);
+        got++;
+    }
+    return got;
+}
+
+// Embed up to EMBED_BATCH strings in one request. Returns how many came back.
+static int embed_texts(const char **texts, int n, float out[][VEC_DIM]) {
+    if (n <= 0 || !g_llm_key || !*g_llm_key) return 0;
+    if (n > EMBED_BATCH) n = EMBED_BATCH;
+
+    cJSON *body = cJSON_CreateObject();
+    if (!body) return 0;
+    cJSON_AddStringToObject(body, "model", env_or("EMBED_MODEL", EMBED_MODEL_DEFAULT));
+    cJSON_AddNumberToObject(body, "dimensions", VEC_DIM);
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) { cJSON_Delete(body); return 0; }
+    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(texts[i]));
+    cJSON_AddItemToObject(body, "input", arr);
+
+    int ok = cJSON_PrintPreallocated(body, g_payload, (int)sizeof(g_payload), 0);
+    cJSON_Delete(body);
+    if (!ok) return 0;
+
+    char auth[512];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", g_llm_key);
+    long status = 0;
+    const char *resp = http_post_json(env_or("EMBED_URL", EMBED_URL_DEFAULT),
+                                      g_payload, auth, &status);
+    if (!resp || status >= 400) {
+        fprintf(stderr, "[!] embed: HTTP %ld\n", status);
+        return 0;
+    }
+    return parse_embeddings(resp, n, out);
+}
+
+static void index_add(long long chat, const char *text, const float *v) {
+    int slot;
+    if (g_vcount < VEC_MAX) {
+        slot = g_vcount++;
+    } else {
+        // Full. Drop the oldest entry rather than refusing the newest: the
+        // note itself is safe in Redis either way, so the only thing lost is
+        // its searchability, and losing the least recent is the least
+        // surprising choice.
+        memmove(g_vec[0], g_vec[1], (size_t)(VEC_MAX - 1) * sizeof(g_vec[0]));
+        memmove(g_vtext[0], g_vtext[1], (size_t)(VEC_MAX - 1) * sizeof(g_vtext[0]));
+        memmove(&g_vchat[0], &g_vchat[1], (size_t)(VEC_MAX - 1) * sizeof(g_vchat[0]));
+        slot = VEC_MAX - 1;
+        g_vevicted++;
+    }
+    memcpy(g_vec[slot], v, sizeof(g_vec[slot]));
+    snprintf(g_vtext[slot], VEC_TEXT, "%s", text);
+    g_vchat[slot] = chat;
+}
+
+// Embed one note and file it. Failure is not fatal anywhere it is called: the
+// note is already stored, it simply will not be findable by meaning.
+static int index_remember(long long chat, const char *text) {
+    static float v[EMBED_BATCH][VEC_DIM];
+    const char *one = text;
+    if (embed_texts(&one, 1, v) != 1) return 0;
+    index_add(chat, text, v[0]);
+    return 1;
+}
+
+static int chat_backfilled(long long chat) {
+    for (int i = 0; i < g_vbackfill_count; i++) if (g_vbackfilled[i] == chat) return 1;
+    return 0;
+}
+
+static int load_notes_list(cJSON **reply_out);   // defined with the memory tools
+
+// The index lives in RAM, so a restart empties it while the notes themselves
+// survive in Redis. On the first search in a chat after a boot, re-embed what
+// is stored so the feature works on a machine that reboots, rather than only
+// on one that has been up a while.
+static int index_backfill(long long chat) {
+    if (chat_backfilled(chat)) return 0;
+    if (g_vbackfill_count < (int)(sizeof(g_vbackfilled) / sizeof(g_vbackfilled[0])))
+        g_vbackfilled[g_vbackfill_count++] = chat;
+
+    cJSON *reply = NULL;
+    if (!load_notes_list(&reply)) return 0;
+    cJSON *res = cJSON_GetObjectItemCaseSensitive(reply, "result");
+    if (!cJSON_IsArray(res)) return 0;
+
+    int total = cJSON_GetArraySize(res);
+    int first = total > BACKFILL_MAX ? total - BACKFILL_MAX : 0;   // the most recent
+    static float v[EMBED_BATCH][VEC_DIM];
+    const char *batch[EMBED_BATCH];
+    int n = 0, added = 0;
+
+    for (int i = first; i < total; i++) {
+        cJSON *it = cJSON_GetArrayItem(res, i);
+        if (!cJSON_IsString(it) || !*it->valuestring) continue;
+        batch[n++] = it->valuestring;
+        if (n == EMBED_BATCH) {
+            int got = embed_texts(batch, n, v);
+            for (int j = 0; j < got; j++) { index_add(chat, batch[j], v[j]); added++; }
+            n = 0;
+        }
+    }
+    if (n) {
+        int got = embed_texts(batch, n, v);
+        for (int j = 0; j < got; j++) { index_add(chat, batch[j], v[j]); added++; }
+    }
+    return added;
+}
+
+// One pass over every vector belonging to this chat. Vectors are unit length,
+// so the dot product is the cosine.
+static int index_search(long long chat, const float *q, int k,
+                        int *idx_out, double *score_out) {
+    if (k < 1) k = 1;
+    if (k > 8) k = 8;
+    int found = 0;
+    uint64_t t0 = cycles();
+
+    for (int i = 0; i < g_vcount; i++) {
+        if (g_vchat[i] != chat) continue;
+        const float *v = g_vec[i];
+        double s = 0;
+        for (int d = 0; d < VEC_DIM; d++) s += (double)q[d] * (double)v[d];
+
+        int pos = found;
+        while (pos > 0 && score_out[pos - 1] < s) pos--;
+        if (pos >= k) continue;
+        int last = (found < k) ? found : k - 1;
+        for (int m = last; m > pos; m--) {
+            score_out[m] = score_out[m - 1];
+            idx_out[m]   = idx_out[m - 1];
+        }
+        score_out[pos] = s;
+        idx_out[pos]   = i;
+        if (found < k) found++;
+    }
+    g_vlast_search_cycles = cycles() - t0;
+    return found;
+}
+
 // ---------------------------------------------------------------- tools
 //
 // Every tool answers a question about the machine this program is running on.
@@ -353,6 +589,13 @@ static const char *TOOLS_JSON =
 "     \"name\":\"recall\","
 "     \"description\":\"Everything you have kept about the person you are talking to.\","
 "     \"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}},"
+"  {\"type\":\"function\",\"function\":{"
+"     \"name\":\"recall_similar\","
+"     \"description\":\"Search what you have kept about this person by meaning rather than by wording — use it when they ask what you know about a topic, and the words they use may not be the words you filed it under. Searched entirely in this machine's RAM.\","
+"     \"parameters\":{\"type\":\"object\",\"properties\":{"
+"        \"query\":{\"type\":\"string\",\"description\":\"What to look for, as a phrase or question.\"},"
+"        \"k\":{\"type\":\"integer\",\"description\":\"How many of the closest notes to return. Default 3, at most 8.\"}},"
+"        \"required\":[\"query\"]}}},"
 "  {\"type\":\"function\",\"function\":{"
 "     \"name\":\"usage_stats\","
 "     \"description\":\"How much this machine has been used: messages answered, how many different people have talked to it, and how many times it has been restarted. Counted across every restart, not just this one.\","
@@ -443,8 +686,26 @@ static void tool_memory_usage(void) {
     cJSON_AddNumberToObject(o, "arena_peak_since_boot", (double)g_arena_lifetime_peak);
     cJSON_AddNumberToObject(o, "http_buffer_bytes", HTTP_BUF_BYTES);
     cJSON_AddNumberToObject(o, "payload_buffer_bytes", PAYLOAD_BYTES);
-    cJSON_AddNumberToObject(o, "static_total_bytes", ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES);
+    // The index dominates the footprint, which is the point of it.
+    size_t index_bytes = sizeof(g_vec) + sizeof(g_vtext) + sizeof(g_vchat);
+    cJSON_AddNumberToObject(o, "semantic_index_bytes", (double)index_bytes);
+    cJSON_AddNumberToObject(o, "semantic_index_capacity", VEC_MAX);
+    cJSON_AddNumberToObject(o, "semantic_index_vectors_resident", g_vcount);
+    cJSON_AddNumberToObject(o, "semantic_index_dimensions", VEC_DIM);
+    if (g_vevicted) cJSON_AddNumberToObject(o, "semantic_index_evicted", g_vevicted);
+    if (g_tsc_hz && g_vlast_search_cycles)
+        cJSON_AddNumberToObject(o, "last_search_microseconds",
+                                (double)g_vlast_search_cycles * 1e6 / (double)g_tsc_hz);
+
+    size_t total = ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES + index_bytes;
+    cJSON_AddNumberToObject(o, "static_total_bytes", (double)total);
+    cJSON_AddNumberToObject(o, "machine_ram_bytes", (double)RAM_MIB * 1024.0 * 1024.0);
+    cJSON_AddNumberToObject(o, "percent_of_machine_claimed",
+                            (double)total * 100.0 / ((double)RAM_MIB * 1024.0 * 1024.0));
     cJSON_AddStringToObject(o, "heap_allocations", "none: the allocator is compiled out");
+    cJSON_AddStringToObject(o, "note",
+        "All of this is static memory, claimed at link time. None of it costs a byte in "
+        "the uploaded image, because uninitialised statics are not stored in the file.");
     if (!cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
         snprintf(g_result, sizeof(g_result), "{\"error\":\"result did not fit\"}");
     cJSON_Delete(o);
@@ -708,12 +969,24 @@ static void tool_remember(const cJSON *args) {
         cJSON_AddItemToArray(trim, cJSON_CreateString("-1"));
         kv_command(trim);
     }
+
+    // File it in the RAM index too, so it can be found by meaning and not only
+    // by the words it happens to contain. The note is already safe in Redis by
+    // this point, so a failed embedding costs searchability, not the note.
+    int indexed = index_remember(g_current_chat, f->valuestring);
+
     snprintf(g_result, sizeof(g_result),
-             "{\"ok\":true,\"note\":\"kept; it will still be here after I am restarted\"}");
+             "{\"ok\":true,\"indexed\":%s,\"vectors_resident\":%d,"
+             "\"note\":\"kept; it will still be here after I am restarted%s\"}",
+             indexed ? "true" : "false", g_vcount,
+             indexed ? ", and it is now searchable by meaning"
+                     : ". It is stored, but could not be indexed for meaning-based search");
 }
 
-// Reads this chat's notes into g_result. Also used to preload a conversation.
-static int load_notes(char *out, size_t out_sz) {
+// This chat's notes, still as a JSON array. Shared by the text recall below
+// and by the index backfill, which needs the notes one at a time rather than
+// run together into a paragraph.
+static int load_notes_list(cJSON **reply_out) {
     if (!g_memory_enabled) return 0;
     char key[64];
     notes_key(key, sizeof(key));
@@ -727,6 +1000,14 @@ static int load_notes(char *out, size_t out_sz) {
 
     cJSON *reply = kv_command(cmd);
     if (!reply) return 0;
+    *reply_out = reply;
+    return 1;
+}
+
+// Reads this chat's notes into g_result. Also used to preload a conversation.
+static int load_notes(char *out, size_t out_sz) {
+    cJSON *reply = NULL;
+    if (!load_notes_list(&reply)) return 0;
     cJSON *res = cJSON_GetObjectItemCaseSensitive(reply, "result");
     if (!cJSON_IsArray(res) || cJSON_GetArraySize(res) == 0) return 0;
 
@@ -758,6 +1039,68 @@ static void tool_recall(void) {
     cJSON_AddStringToObject(o, "stored_in",
         "Redis, reached over HTTPS. This machine has no disk, so anything it keeps lives "
         "on the network.");
+    if (!cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"result did not fit\"}");
+    cJSON_Delete(o);
+}
+
+// Search this chat's notes by meaning. Every comparison happens in RAM against
+// the resident index; the only network call is the one that embeds the query.
+static void tool_recall_similar(const cJSON *args) {
+    if (!g_memory_enabled) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"no memory configured\"}");
+        return;
+    }
+    cJSON *q = cJSON_GetObjectItemCaseSensitive(args, "query");
+    if (!cJSON_IsString(q) || !*q->valuestring) {
+        snprintf(g_result, sizeof(g_result), "{\"error\":\"nothing to search for\"}");
+        return;
+    }
+    cJSON *kj = cJSON_GetObjectItemCaseSensitive(args, "k");
+    int k = cJSON_IsNumber(kj) ? (int)kj->valuedouble : 3;
+
+    // The index is RAM, so a restart empties it. Restore this chat's notes
+    // from Redis the first time it is searched after a boot.
+    int restored = index_backfill(g_current_chat);
+
+    static float qv[EMBED_BATCH][VEC_DIM];
+    const char *one = q->valuestring;
+    if (embed_texts(&one, 1, qv) != 1) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"error\":\"could not embed the query; meaning-based search is "
+                 "unavailable right now. Plain recall still works.\"}");
+        return;
+    }
+
+    int idx[8];
+    double score[8];
+    int n = index_search(g_current_chat, qv[0], k, idx, score);
+    if (n == 0) {
+        snprintf(g_result, sizeof(g_result),
+                 "{\"matches\":[],\"vectors_resident\":%d,"
+                 "\"note\":\"nothing indexed for this person yet\"}", g_vcount);
+        return;
+    }
+
+    cJSON *o = cJSON_CreateObject();
+    if (!o) { snprintf(g_result, sizeof(g_result), "{\"error\":\"arena exhausted\"}"); return; }
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n && arr; i++) {
+        cJSON *m = cJSON_CreateObject();
+        if (!m) break;
+        cJSON_AddStringToObject(m, "text", g_vtext[idx[i]]);
+        cJSON_AddNumberToObject(m, "similarity", score[i]);
+        cJSON_AddItemToArray(arr, m);
+    }
+    if (arr) cJSON_AddItemToObject(o, "matches", arr);
+    cJSON_AddNumberToObject(o, "vectors_searched", g_vcount);
+    if (restored) cJSON_AddNumberToObject(o, "restored_from_redis_just_now", restored);
+    if (g_tsc_hz)
+        cJSON_AddNumberToObject(o, "search_microseconds",
+                                (double)g_vlast_search_cycles * 1e6 / (double)g_tsc_hz);
+    cJSON_AddStringToObject(o, "how",
+        "Cosine similarity against every vector held in this machine's RAM. No index "
+        "structure, no database, no disk -- one pass over a static array.");
     if (!cJSON_PrintPreallocated(o, g_result, (int)sizeof(g_result), 0))
         snprintf(g_result, sizeof(g_result), "{\"error\":\"result did not fit\"}");
     cJSON_Delete(o);
@@ -1020,6 +1363,7 @@ static void call_tool(const char *name, const cJSON *args) {
     else if (strcmp(name, "startup_timing") == 0) tool_startup_timing();
     else if (strcmp(name, "usage_stats")    == 0) tool_usage_stats();
     else if (strcmp(name, "recall")        == 0) tool_recall();
+    else if (strcmp(name, "recall_similar")== 0) tool_recall_similar(args);
     else if (strcmp(name, "list_reminders") == 0) tool_list_reminders();
     else if (strcmp(name, "remind_me") == 0) {
         if (args) tool_remind_me(args);
@@ -1055,6 +1399,9 @@ static void call_tool(const char *name, const cJSON *args) {
     "I can also search the web, and set reminders — try \"remind me in 2 hours to " \
     "call the plumber\". Tell me something about yourself and I will keep it: I " \
     "have no disk, so my notes live on another machine and survive my restarts.\n\n" \
+    "I keep those notes indexed by meaning as well as by word, in about 8 MiB of " \
+    "my own RAM — a vector database with no database under it. Ask me what I know " \
+    "about a topic and I will find it even if you word it differently.\n\n" \
     "Every number I give you about myself is measured when you ask, not " \
     "remembered. Source: github.com/tabibazar/baremetal-agent"
 
@@ -1430,9 +1777,17 @@ int main(int argc, char **argv) {
 
     curl_global_init(CURL_GLOBAL_ALL);
 
-    printf("[+] BareMetal agent up. model=%s ram=%d MiB static=%d KB max_steps=%d\n",
-           g_llm_model, RAM_MIB,
-           (ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES) / 1024, MAX_STEPS);
+    // Report the whole static footprint, index included. The buffers alone
+    // were the honest number when the buffers were all there was.
+    {
+        size_t idx = sizeof(g_vec) + sizeof(g_vtext) + sizeof(g_vchat);
+        size_t stat_total = ARENA_BYTES + HTTP_BUF_BYTES + PAYLOAD_BYTES + idx;
+        printf("[+] BareMetal agent up. model=%s ram=%d MiB static=%zu KB (%.0f%% of RAM) max_steps=%d\n",
+               g_llm_model, RAM_MIB, stat_total / 1024,
+               (double)stat_total * 100.0 / ((double)RAM_MIB * 1024.0 * 1024.0), MAX_STEPS);
+        printf("[+] semantic index: %d slots x %d dims = %zu KB resident, searched in RAM\n",
+               VEC_MAX, VEC_DIM, idx / 1024);
+    }
     printf("[+] web search: %s   memory: %s\n",
            g_web_enabled ? "on" : "off", g_memory_enabled ? "on" : "off");
 

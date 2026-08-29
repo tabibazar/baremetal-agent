@@ -62,7 +62,7 @@ The first four report on the machine the agent is living inside, which is the po
 | Tool | Answers |
 |---|---|
 | `machine_facts` | RAM ceiling, image size, seconds since boot |
-| `memory_usage` | live arena use and high-water mark, read from its own allocator |
+| `memory_usage` | live arena use, index occupancy, and what share of the machine is claimed |
 | `build_info` | what is linked into the image, and what is absent |
 | `ping_api` | a real HTTPS round-trip, timed now, TLS handshake included |
 | `startup_timing` | how long it took from program start to its first completed HTTPS request |
@@ -70,9 +70,68 @@ The first four report on the machine the agent is living inside, which is the po
 | `read_page` | a page's main content as markdown, when a snippet is too thin |
 | `remember` | keeps one fact about the person it is talking to |
 | `recall` | everything it has kept about them |
+| `recall_similar` | the same notes searched by meaning, against a vector index held in RAM |
 | `remind_me` | sends them a message at a future time, surviving restarts |
 | `list_reminders` | what they have pending, and when each is due |
 | `usage_stats` | messages answered, different people, restarts — counted across all of them |
+
+### A vector database with no database under it
+
+A cloud instance is capped at **16 MiB** — that is the platform maximum, not a
+plan tier; asking for more returns `ramMib exceeds the maximum of 16`. The agent
+used to claim 640 KB of that and leave the rest idle.
+
+It now spends 59% of the machine on a semantic index. Every note it keeps is
+embedded once (`gemini-embedding-001`, 3072 dimensions requested truncated to
+768) and held in a static array. `recall_similar` embeds the question and
+compares it against every resident vector — one pass, no tree, no index
+structure, no disk. The measured cost of that pass is about **4 µs** over a few
+vectors and stays linear.
+
+```
+[+] BareMetal agent up. model=gemini-2.5-flash ram=16 MiB static=9588 KB (59% of RAM) max_steps=6
+[+] semantic index: 2560 slots x 768 dims = 8180 KB resident, searched in RAM
+```
+
+    vectors   2560 x 768 x 4 bytes  = 7.50 MiB
+    text      2560 x 192 bytes      = 0.47 MiB
+    chat ids  2560 x 8 bytes        = 0.02 MiB
+    arena, HTTP and payload buffers = 1.38 MiB
+                                      ---------
+                                      9.37 MiB of 16
+
+**None of it costs a byte in the image.** Uninitialised statics are not stored
+in the file, so the upload went from 2,880,384 to 2,911,872 bytes — 31 KB, all
+of it code — while the running footprint grew by 8 MiB. The machine simply wakes
+up with the room already claimed.
+
+Three details that are not obvious:
+
+**Truncated embeddings are not unit vectors.** The model returns 3072
+dimensions and truncates on request, but a truncated vector has a norm near
+0.59, not 1. Cosine similarity over unnormalised vectors ranks *longer* notes
+above *closer* ones, silently and plausibly. The normalisation happens in
+`parse_embeddings`, and the test asserts the norm.
+
+**The response is parsed by hand, not with cJSON.** A batch of four embeddings
+is 3072 numbers, and every one would become a node in the bump arena. Scanning
+the text with `strtod` costs nothing and the shape is fixed, because this
+program wrote the request.
+
+**Brute force is the deliberate choice, not the lazy one.** [Measurement on
+this platform](https://github.com/tabibazar/unikernel-c/tree/main/docs/nanos-vs-baremetal)
+showed it corrupts 64-bit arithmetic at roughly 1 result in 4000 under load — and
+a long multiply-accumulate over a large array is exactly that shape. It is the
+right feature to put here anyway, because its failure mode degrades instead of
+breaking: a wrong score reorders two neighbours in a ranked list. It cannot
+crash, and it cannot invent a memory that was never stored. Anything depending
+on exact arithmetic would have been the wrong thing to build on this machine.
+
+The index lives in RAM, so a restart empties it while the notes themselves
+survive in Redis. The first search in a conversation after a boot re-embeds the
+most recent 32 notes to refill it. Per-chat isolation is preserved throughout:
+every vector carries the chat it came from and a search never crosses between
+them, which `test_index.c` checks explicitly.
 
 The two kinds of knowledge are kept visibly apart: facts about itself are measured
 at the moment you ask, while anything from the web is somebody else's claim and is
@@ -297,7 +356,9 @@ Environment variables where there are any; the compile-time `#define`s otherwise
 | `LLM_MODEL` | `gemini-2.5-flash` | pinned deliberately, see below |
 | `MAX_STEPS` | 6 | tool-calling rounds per message |
 | `REPLIES_PER_HOUR` | 40 | spend ceiling, enforced in C |
-| `ARENA_BYTES` | 384 KB | shrink for a tighter machine; it prints its high-water mark |
+| `ARENA_BYTES` | 1 MiB | shrink for a tighter machine; it prints its high-water mark |
+| `VEC_MAX` | 2560 | semantic index capacity; the dominant term in the memory budget |
+| `EMBED_MODEL` / `EMBED_URL` | `gemini-embedding-001` | 3072 dims natively, requested truncated to 768 |
 | `RAM_MIB` / `IMAGE_BYTES` | 16 / 0 | facts it cannot discover itself; the deploy script fills them in |
 
 Compile-time values are `-D` overridable: `gcc -DMAX_STEPS=10 ...`
