@@ -75,6 +75,10 @@ The first four report on the machine the agent is living inside, which is the po
 | `list_reminders` | what they have pending, and when each is due |
 | `usage_stats` | messages answered, different people, restarts — counted across all of them |
 
+**Using it:** [docs/using-the-bot.html](docs/using-the-bot.html) is a guide for
+people who just want to talk to it — every feature, every limit, and real
+transcripts rather than invented ones.
+
 ### A vector database with no database under it
 
 A cloud instance is capped at **16 MiB** — that is the platform maximum, not a

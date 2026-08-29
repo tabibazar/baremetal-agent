@@ -1,0 +1,253 @@
+<title>Talking to a Unikernel</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground:#f6f4ef; --surface:#fff; --surface-alt:#efece4; --ink:#17140e; --ink-soft:#55503f;
+    --ink-faint:#8a8471; --rule:#ddd8ca; --accent:#a35f00; --accent-soft:#f6e8cd;
+    --ok:#2f6b3d; --bad:#a03028; --bubble-you:#f0e3c8; --bubble-bot:#fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:#0b0906; --surface:#14110b; --surface-alt:#1d1810; --ink:#ece5d6; --ink-soft:#b3a68a;
+      --ink-faint:#7d7259; --rule:#2e2718; --accent:#ffb000; --accent-soft:#3a2c10;
+      --ok:#7fc08c; --bad:#e8776c; --bubble-you:#33280f; --bubble-bot:#191509;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:#0b0906; --surface:#14110b; --surface-alt:#1d1810; --ink:#ece5d6; --ink-soft:#b3a68a;
+    --ink-faint:#7d7259; --rule:#2e2718; --accent:#ffb000; --accent-soft:#3a2c10;
+    --ok:#7fc08c; --bad:#e8776c; --bubble-you:#33280f; --bubble-bot:#191509;
+  }
+  * { box-sizing:border-box; }
+  body { background:var(--ground); color:var(--ink); font-family:"IBM Plex Sans",system-ui,sans-serif;
+         font-size:16.5px; line-height:1.62; margin:0; padding:0 24px 96px; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:940px; margin:0 auto; }
+  header { padding:74px 0 30px; border-bottom:2px solid var(--ink); }
+  .eyebrow { font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:0.14em;
+             text-transform:uppercase; color:var(--accent); margin:0 0 18px; }
+  h1 { font-family:"IBM Plex Mono",monospace; font-weight:600; font-size:clamp(31px,5.4vw,50px);
+       line-height:1.04; letter-spacing:-0.028em; text-wrap:balance; margin:0 0 20px; }
+  .standfirst { font-size:19px; line-height:1.55; color:var(--ink-soft); max-width:64ch; margin:0; }
+  h2 { font-family:"IBM Plex Mono",monospace; font-size:13px; font-weight:600; letter-spacing:0.14em;
+       text-transform:uppercase; color:var(--accent); margin:56px 0 10px; padding-bottom:10px;
+       border-bottom:1px solid var(--rule); }
+  h3 { font-size:20px; font-weight:600; margin:34px 0 4px; text-wrap:balance; }
+  p { margin:13px 0; max-width:70ch; }
+  ul { max-width:70ch; padding-left:22px; }
+  li { margin:7px 0; }
+  code { font-family:"IBM Plex Mono",monospace; font-size:0.87em; background:var(--surface-alt);
+         padding:1px 5px; border-radius:2px; }
+  a { color:var(--accent); }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:16px 0; font-size:13.5px; }
+  th,td { text-align:left; padding:8px 11px; border-bottom:1px solid var(--rule); vertical-align:top; }
+  th { font-family:"IBM Plex Mono",monospace; font-size:10.5px; letter-spacing:0.08em;
+       text-transform:uppercase; color:var(--ink-faint); font-weight:500; }
+  td.mono { font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums; white-space:nowrap; }
+
+  /* the transcript component: every example is a real exchange, and the tag
+     shows which tool actually ran to produce it */
+  .chat { display:flex; flex-direction:column; gap:9px; margin:18px 0 6px; max-width:74ch; }
+  .you, .bot { padding:11px 15px; border-radius:14px; font-size:15.5px; line-height:1.5; }
+  .you { align-self:flex-end; background:var(--bubble-you); border-bottom-right-radius:4px; max-width:82%; }
+  .bot { align-self:flex-start; background:var(--bubble-bot); border:1px solid var(--rule);
+         border-bottom-left-radius:4px; max-width:88%; }
+  .tool { align-self:flex-start; font-family:"IBM Plex Mono",monospace; font-size:11px;
+          color:var(--ink-faint); letter-spacing:0.04em; margin:-2px 0 -3px 4px; }
+  .tool b { color:var(--accent); font-weight:500; }
+
+  .callout { border:1px solid var(--rule); border-left:3px solid var(--accent); background:var(--surface);
+             padding:17px 19px; margin:22px 0; }
+  .callout.warn { border-left-color:var(--bad); }
+  .callout p { margin:8px 0 0; max-width:none; }
+  .callout p:first-child { margin-top:0; }
+  .callout h4 { font-family:"IBM Plex Mono",monospace; font-size:13px; font-weight:600; margin:0 0 8px; }
+  .start { border:1px solid var(--accent); background:var(--accent-soft); padding:22px 24px; margin:26px 0; }
+  .start p { margin:6px 0; max-width:none; }
+  .start .big { font-family:"IBM Plex Mono",monospace; font-size:27px; font-weight:600; color:var(--accent); }
+  pre { font-family:"IBM Plex Mono",monospace; font-size:12.5px; line-height:1.7; background:var(--surface-alt);
+        border-left:3px solid var(--accent); padding:15px 18px; overflow-x:auto; margin:18px 0; }
+  footer { border-top:2px solid var(--ink); padding-top:20px; margin-top:60px; font-size:14px; color:var(--ink-faint); }
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">A guide to @unikernel_bot</p>
+  <h1>Talking to a Unikernel</h1>
+  <p class="standfirst">There is a Telegram bot whose replies come from a program with no operating system underneath it. No kernel, no shell, no container, no disk — 2.9 MB of machine in 16 MiB of RAM. Here is everything it can do, with real transcripts.</p>
+</header>
+
+<div class="start">
+  <p class="big">Message @unikernel_bot on Telegram</p>
+  <p>Send <code>/start</code>. That first reply is written in C, not by the model — it is the one answer the machine gives without asking anything.</p>
+</div>
+
+<section>
+  <h2>What you are actually talking to</h2>
+  <p>Most bots are a program, inside a runtime, inside a container, inside a Linux VM, on a host. This one is a single compiled binary that <em>is</em> the machine. It is loaded by the hypervisor and execution begins in its own <code>main()</code>. There is nothing else running — no process to restart, no shell to log into, no filesystem to write to.</p>
+  <p>That is why almost every question about itself has a real answer. It is not describing a machine from the outside; it is the machine, and it measures itself when you ask.</p>
+</section>
+
+<section>
+  <h2>Ask it about itself</h2>
+  <p>This is what it is best at. Every number comes from a measurement taken at the moment you ask — the system prompt forbids estimating, rounding into a nicer figure, or recalling a number from training.</p>
+
+  <div class="chat">
+    <div class="you">What are you running on?</div>
+    <div class="tool">used <b>machine_facts</b></div>
+    <div class="bot">I'm running on a bare-metal unikernel under Firecracker, with 16 MiB of RAM. The image itself is the entire machine, so there's nothing else installed or running. I've been up for 1 second.</div>
+  </div>
+
+  <div class="chat">
+    <div class="you">How much memory are you using right now?</div>
+    <div class="tool">used <b>memory_usage</b></div>
+    <div class="bot">I am currently using 9.8MB of static memory. My arena usage is 25.5KB right now, with a peak of 25.6KB in this conversation and 25.7KB since I last booted. I also have 8.3MB allocated for the semantic index, 262.1KB for HTTP buffers, and 131.1KB for payload buffers. This means I'm using about 58.5% of the machine's total RAM.</div>
+  </div>
+
+  <div class="chat">
+    <div class="you">What is inside your image?</div>
+    <div class="tool">used <b>build_info</b></div>
+    <div class="bot">I have musl libc, lwIP (TCP/IP), mbedTLS (TLS 1.3), libcurl (HTTP), cJSON, and the Mozilla CA bundle linked in. I do not have an operating system, kernel, init, shell, package manager, container runtime, or language runtime. I am running the gemini-2.5-flash model.</div>
+  </div>
+
+  <div class="chat">
+    <div class="you">How quickly did you start up?</div>
+    <div class="tool">used <b>startup_timing</b></div>
+    <div class="bot">I started up in 85.9 milliseconds. This includes the process start, network bring-up, DNS, TCP connect, TLS handshake, and the first HTTP response. It excludes the virtual machine booting before the program began.</div>
+  </div>
+
+  <p>Also worth asking: <em>“how fast is your connection?”</em> (it opens a real HTTPS connection and times the handshake), and <em>“how many people have talked to you?”</em> (counted across every restart, not just this one).</p>
+
+  <div class="callout">
+    <h4>Try to catch it out</h4>
+    <p>Ask something it cannot measure — “how many CPU cores could you have?”, “what does this cost to run?” — and it should tell you it does not know rather than guess. If it ever gives you a number about itself that it could not have measured, that is a bug worth reporting.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Tell it things, and ask later in different words</h2>
+  <p>The machine has no disk. Anything it keeps lives on another machine, a network round-trip away — and it survives restarts, of which there have been dozens.</p>
+
+  <div class="chat">
+    <div class="you">Remember that I take my coffee black, no sugar.</div>
+    <div class="tool">used <b>remember</b></div>
+    <div class="bot">I've made a note that you take your coffee black, no sugar.</div>
+  </div>
+
+  <p>The interesting part is getting it back. It keeps a <strong>semantic index in its own RAM</strong> — every note embedded as a 768-dimension vector in a static array — so it finds things by meaning rather than by the words you happened to use:</p>
+
+  <div class="chat">
+    <div class="you">What did I say about how I like my espresso?</div>
+    <div class="tool">used <b>recall_similar</b> — “espresso” was never in the note</div>
+    <div class="bot">You like your coffee black, no sugar.</div>
+  </div>
+
+  <p>There are two ways to get memories back and it picks between them. <code>recall</code> returns your most recent notes in order, for “what do you know about me?”. <code>recall_similar</code> searches <em>all</em> of them by meaning — one pass over the array, no database, no disk, about 47 microseconds across thirty notes.</p>
+  <p>It keeps the last <strong>100</strong> things per person and forgets the oldest beyond that. Notes are strictly per-conversation: every vector carries the chat it came from, and a search cannot cross between them. Your notes are not readable by anyone else talking to the same bot, however they ask.</p>
+</section>
+
+<section>
+  <h2>Ask it to remind you</h2>
+  <p>Reminders are delivered even if the machine restarts in between — they live in the same off-machine store the notes do.</p>
+
+  <div class="chat">
+    <div class="you">Remind me in 3 hours to call the plumber.</div>
+    <div class="tool">used <b>remind_me</b> with <code>in_seconds: 10800</code></div>
+    <div class="bot">I've set a reminder for you in 3 hours to call the plumber.</div>
+  </div>
+
+  <div class="chat">
+    <div class="you">What reminders do I have?</div>
+    <div class="tool">used <b>list_reminders</b></div>
+    <div class="bot">You have a reminder set to "call the plumber" in approximately 3 hours.</div>
+  </div>
+
+  <p>Say it however you like — “tomorrow morning”, “in 20 minutes”, “next Friday”. It works out the delay itself. Anything from 20 seconds to 90 days ahead, up to 20 pending at a time.</p>
+
+  <div class="callout">
+    <h4>Why it asks for a delay and not a date</h4>
+    <p>An earlier version asked the model for an absolute Unix timestamp. It failed about half the time with an empty reply, and when it did answer it sometimes produced a timestamp from December 2023 — recalled from training rather than computed. Switching to “how many seconds from now” took it to five clean runs out of five. The clock arithmetic belongs in C.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Ask about the outside world</h2>
+  <p>It can search the web and read pages. It keeps the two kinds of knowledge visibly apart: things about itself are measured here and now, things from the web are somebody else's claim, and it tells you which it is giving you.</p>
+
+  <div class="chat">
+    <div class="you">What is MirageOS and who maintains it?</div>
+    <div class="tool">used <b>web_search</b></div>
+    <div class="bot">MirageOS is a library operating system that allows you to construct secure, specialised unikernels. It is an open-source project created and maintained by the MirageOS Core Team.</div>
+  </div>
+
+  <p>If a search snippet is too thin, it will fetch the page itself and read the whole thing. But it can only open a page whose host appeared in a search result it just ran — it cannot be talked into fetching an arbitrary URL you hand it. That guard is in the C, not in the prompt, because a prompt can be argued with.</p>
+
+  <div class="callout warn">
+    <h4>Web answers are only as good as the search</h4>
+    <p>Treat anything it read online the way you would treat a search result, not the way you would treat its measurements of itself. In testing it confidently reported a Formula 1 result that was almost certainly stale. It is honest about where a claim came from; it cannot vouch for the claim.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Everything it can do</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>Ask for</th><th>Tool</th><th>What actually happens</th></tr>
+    <tr><td>What it runs on</td><td class="mono">machine_facts</td><td>RAM ceiling, image size, seconds since boot</td></tr>
+    <tr><td>Its memory use</td><td class="mono">memory_usage</td><td>Live figures from its own allocator, plus index occupancy</td></tr>
+    <tr><td>What is in the image</td><td class="mono">build_info</td><td>What is linked in, and what is absent</td></tr>
+    <tr><td>Its network speed</td><td class="mono">ping_api</td><td>A real HTTPS round trip, timed now, TLS handshake included</td></tr>
+    <tr><td>Its boot time</td><td class="mono">startup_timing</td><td>Program start to first completed HTTPS, by CPU cycle counter</td></tr>
+    <tr><td>How busy it has been</td><td class="mono">usage_stats</td><td>Messages, distinct people, restarts — across all boots</td></tr>
+    <tr><td>To remember something</td><td class="mono">remember</td><td>Stored off-machine, and embedded into the RAM index</td></tr>
+    <tr><td>What it knows about you</td><td class="mono">recall</td><td>Your 25 most recent notes, and a count of the rest</td></tr>
+    <tr><td>A topic you mentioned</td><td class="mono">recall_similar</td><td>Cosine similarity over every vector in RAM</td></tr>
+    <tr><td>A reminder</td><td class="mono">remind_me</td><td>Queued off-machine; survives restarts</td></tr>
+    <tr><td>Your pending reminders</td><td class="mono">list_reminders</td><td>What is queued, and when each is due</td></tr>
+    <tr><td>Something on the web</td><td class="mono">web_search</td><td>Title, URL and description, via Firecrawl</td></tr>
+    <tr><td>A page in full</td><td class="mono">read_page</td><td>Main content as markdown — allowlisted hosts only</td></tr>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>The limits, stated plainly</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>Thing</th><th class="mono">Limit</th><th>Why</th></tr>
+    <tr><td>Machine memory</td><td class="mono">16 MiB</td><td>The platform maximum, not a plan tier</td></tr>
+    <tr><td>Claimed by the agent</td><td class="mono">9.37 MiB</td><td>59% of it, mostly the semantic index</td></tr>
+    <tr><td>Replies per hour</td><td class="mono">300</td><td>A spend ceiling, enforced in C rather than asked for in the prompt</td></tr>
+    <tr><td>Tool rounds per message</td><td class="mono">6</td><td>Stops a confused loop costing real money</td></tr>
+    <tr><td>Notes kept per person</td><td class="mono">100</td><td>Oldest dropped past that</td></tr>
+    <tr><td>Vectors resident</td><td class="mono">2,560</td><td>768 dimensions each, float32</td></tr>
+    <tr><td>Pending reminders</td><td class="mono">20 per person</td><td>20 seconds to 90 days ahead</td></tr>
+    <tr><td>Poll interval</td><td class="mono">3 seconds</td><td>Worst case before it sees your message</td></tr>
+  </table>
+  </div>
+
+  <h3>Things it genuinely cannot do</h3>
+  <ul>
+    <li><strong>Write a file.</strong> There is no writable filesystem — <code>open(O_CREAT)</code> fails, verified. Everything it keeps goes over the network.</li>
+    <li><strong>Remember an image, voice note or document.</strong> It reads text messages only.</li>
+    <li><strong>Keep its index across a restart.</strong> The vectors live in RAM and die with it. Your notes survive, and the first topical search after a restart rebuilds the index from them — that one takes a few seconds longer.</li>
+    <li><strong>Reliably decide to search its own memory.</strong> Roughly three times in four it searches before saying it does not know something about you. If you get a “don't know” that feels wrong, ask again more specifically — the note is usually there.</li>
+  </ul>
+</section>
+
+<section>
+  <h2>If you want to run your own</h2>
+  <p>The whole thing is about 1,900 lines of C, MIT licensed, with no heap: cJSON is pointed at a static bump arena and the allocator is compiled out, so a future edit cannot quietly reintroduce one.</p>
+  <pre>git clone https://github.com/tabibazar/baremetal-agent
+# then follow README.md — you need a Linux x86-64 host,
+# a Telegram bot token, and a model API key.
+make            # builds for Linux/macOS, same source as the unikernel</pre>
+  <p>It runs unchanged as an ordinary process on Linux and macOS, which is how it is developed; the unikernel build is a different link, not different code. <code>./bmagent --ask "..."</code> answers one question in your terminal without Telegram involved, which is the fastest way to see it work.</p>
+</section>
+
+<footer>
+  <p>Every exchange on this page is a real one, captured from the agent against its live store — none are written by hand. Figures are from the running instance and will drift as it is used. Source and the full technical write-up: <a href="https://github.com/tabibazar/baremetal-agent">github.com/tabibazar/baremetal-agent</a>. The unikernel is <a href="https://github.com/ReturnInfinity/BareMetal">BareMetal</a> by Return Infinity.</p>
+</footer>
+
+</div>
